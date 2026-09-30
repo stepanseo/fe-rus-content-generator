@@ -20,7 +20,6 @@ prompts/ocfilter/section_mapping.json
 # PyInstaller
 build/
 dist/
-*.spec
 
 # Python
 __pycache__/
