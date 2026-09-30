@@ -1,0 +1,35 @@
+# Локальный конфиг с логином/паролем от SSH и API-ключом — никогда не в гит
+config_oc.json
+
+# Отчёты о генерации (товары и SEO-страницы) — рантайм-данные, растут на сервере
+ai_desc_report_section_*.json
+ai_ocfilter_report_batch_*.json
+
+# Списки URL для партий SEO-страниц — вводятся через GUI каждый раз заново
+ocfilter_urls_batch_*.txt
+
+# Файлы фонового запуска на сервере (лог + pid одного прогона)
+gui_run_oc_*.log
+gui_run_oc_*.pid
+
+# Привязки промптов к ID категорий/партий — состояние, меняется через GUI,
+# не редактируется руками через гит
+prompts/section_mapping.json
+prompts/ocfilter/section_mapping.json
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ОС/редакторы
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
