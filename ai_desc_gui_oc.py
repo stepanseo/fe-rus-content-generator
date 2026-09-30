@@ -158,35 +158,45 @@ class App:
 
         ttk.Label(conn_frame, text="Хост:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.host_var = tk.StringVar(value=self.cfg["host"])
-        ttk.Entry(conn_frame, textvariable=self.host_var, width=25).grid(row=0, column=1, padx=4, pady=4)
+        host_entry = ttk.Entry(conn_frame, textvariable=self.host_var, width=25)
+        host_entry.grid(row=0, column=1, padx=4, pady=4)
+        setup_text_editing_shortcuts(host_entry)
 
         ttk.Label(conn_frame, text="Порт:").grid(row=0, column=2, sticky="e", padx=4, pady=4)
         self.port_var = tk.StringVar(value=str(self.cfg["port"]))
-        ttk.Entry(conn_frame, textvariable=self.port_var, width=6).grid(row=0, column=3, padx=4, pady=4)
+        port_entry = ttk.Entry(conn_frame, textvariable=self.port_var, width=6)
+        port_entry.grid(row=0, column=3, padx=4, pady=4)
+        setup_text_editing_shortcuts(port_entry)
 
         ttk.Label(conn_frame, text="Логин:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
         self.user_var = tk.StringVar(value=self.cfg["username"])
-        ttk.Entry(conn_frame, textvariable=self.user_var, width=25).grid(row=1, column=1, padx=4, pady=4)
+        user_entry = ttk.Entry(conn_frame, textvariable=self.user_var, width=25)
+        user_entry.grid(row=1, column=1, padx=4, pady=4)
+        setup_text_editing_shortcuts(user_entry)
 
         ttk.Label(conn_frame, text="Пароль:").grid(row=1, column=2, sticky="e", padx=4, pady=4)
         self.pass_var = tk.StringVar(value=self.cfg["password"])
-        ttk.Entry(conn_frame, textvariable=self.pass_var, width=20, show="*").grid(row=1, column=3, padx=4, pady=4)
+        pass_entry = ttk.Entry(conn_frame, textvariable=self.pass_var, width=20, show="*")
+        pass_entry.grid(row=1, column=3, padx=4, pady=4)
+        setup_text_editing_shortcuts(pass_entry)
 
         ttk.Label(conn_frame, text="Путь к скрипту на сервере:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
         self.path_var = tk.StringVar(value=self.cfg["remote_path"])
-        ttk.Entry(conn_frame, textvariable=self.path_var, width=55).grid(
-            row=2, column=1, columnspan=3, sticky="w", padx=4, pady=4
-        )
+        path_entry = ttk.Entry(conn_frame, textvariable=self.path_var, width=55)
+        path_entry.grid(row=2, column=1, columnspan=3, sticky="w", padx=4, pady=4)
+        setup_text_editing_shortcuts(path_entry)
 
         ttk.Label(conn_frame, text="Ключ API (router.cheap, sk-...):").grid(row=3, column=0, sticky="e", padx=4, pady=4)
         self.api_key_var = tk.StringVar(value=self.cfg["router_cheap_api_key"])
-        ttk.Entry(conn_frame, textvariable=self.api_key_var, width=55, show="*").grid(
-            row=3, column=1, columnspan=3, sticky="w", padx=4, pady=4
-        )
+        api_key_entry = ttk.Entry(conn_frame, textvariable=self.api_key_var, width=55, show="*")
+        api_key_entry.grid(row=3, column=1, columnspan=3, sticky="w", padx=4, pady=4)
+        setup_text_editing_shortcuts(api_key_entry)
 
         ttk.Label(conn_frame, text="Модель:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
         self.model_var = tk.StringVar(value=self.cfg["router_cheap_model"])
-        ttk.Entry(conn_frame, textvariable=self.model_var, width=25).grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        model_entry = ttk.Entry(conn_frame, textvariable=self.model_var, width=25)
+        model_entry.grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        setup_text_editing_shortcuts(model_entry)
 
         ttk.Button(conn_frame, text="Сохранить настройки подключения", command=self._save_settings).grid(
             row=5, column=0, columnspan=4, pady=6
@@ -219,11 +229,15 @@ class App:
 
         ttk.Label(run_frame, text="ID раздела:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.section_var = tk.StringVar()
-        ttk.Entry(run_frame, textvariable=self.section_var, width=12).grid(row=0, column=1, padx=4, pady=4)
+        section_entry = ttk.Entry(run_frame, textvariable=self.section_var, width=12)
+        section_entry.grid(row=0, column=1, padx=4, pady=4)
+        setup_text_editing_shortcuts(section_entry)
 
         ttk.Label(run_frame, text="Лимит товаров (необязательно):").grid(row=0, column=2, sticky="e", padx=4, pady=4)
         self.limit_var = tk.StringVar()
-        ttk.Entry(run_frame, textvariable=self.limit_var, width=8).grid(row=0, column=3, padx=4, pady=4)
+        limit_entry = ttk.Entry(run_frame, textvariable=self.limit_var, width=8)
+        limit_entry.grid(row=0, column=3, padx=4, pady=4)
+        setup_text_editing_shortcuts(limit_entry)
 
         btn_frame = ttk.Frame(run_frame)
         btn_frame.grid(row=1, column=0, columnspan=4, pady=(4, 4))
@@ -739,11 +753,15 @@ class App:
         id_frame.pack(fill="x", pady=(8, 6))
         ttk.Label(id_frame, text="ID партии (для файлов отчёта):").pack(side="left")
         self.ocfilter_batch_var = tk.StringVar()
-        ttk.Entry(id_frame, textvariable=self.ocfilter_batch_var, width=12).pack(side="left", padx=6)
+        ocfilter_batch_entry = ttk.Entry(id_frame, textvariable=self.ocfilter_batch_var, width=12)
+        ocfilter_batch_entry.pack(side="left", padx=6)
+        setup_text_editing_shortcuts(ocfilter_batch_entry)
 
         ttk.Label(id_frame, text="Лимит страниц за прогон (необязательно):").pack(side="left", padx=(16, 0))
         self.ocfilter_limit_var = tk.StringVar()
-        ttk.Entry(id_frame, textvariable=self.ocfilter_limit_var, width=8).pack(side="left", padx=6)
+        ocfilter_limit_entry = ttk.Entry(id_frame, textvariable=self.ocfilter_limit_var, width=8)
+        ocfilter_limit_entry.pack(side="left", padx=6)
+        setup_text_editing_shortcuts(ocfilter_limit_entry)
 
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(pady=(0, 4))
