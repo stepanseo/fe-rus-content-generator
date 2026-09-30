@@ -1,0 +1,38 @@
+# Конфиг с логином/паролем — не в гит
+config_oc.json
+
+# Отчёты о генерации (товары и SEO-страницы)
+ai_desc_report_section_*.json
+ai_ocfilter_report_batch_*.json
+
+# Списки URL для партий SEO-страниц
+ocfilter_urls_batch_*.txt
+ocfilter_urls_input.txt
+
+# Логи и pid фоновых запусков
+gui_run_oc_*.log
+gui_run_oc_*.pid
+
+# Временные файлы промпт-редактора
+prompt_critique_temp.txt
+prompt_test_temp.txt
+
+# Привязки промптов к ID — состояние, не редактируется руками
+prompts/section_mapping.json
+prompts/ocfilter/section_mapping.json
+
+# PyInstaller
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ОС/редакторы
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
