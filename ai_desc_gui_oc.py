@@ -239,8 +239,24 @@ class App:
         limit_entry.grid(row=0, column=3, padx=4, pady=4)
         setup_text_editing_shortcuts(limit_entry)
 
+        scope_frame = ttk.LabelFrame(run_frame, text="Какие товары обрабатывать")
+        scope_frame.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 6))
+        self.product_scope_var = tk.StringVar(value="all")
+        ttk.Radiobutton(
+            scope_frame, text="Все товары категории",
+            variable=self.product_scope_var, value="all",
+        ).pack(side="left", padx=8, pady=4)
+        ttk.Radiobutton(
+            scope_frame, text="Только открытые для Google",
+            variable=self.product_scope_var, value="google_indexable",
+        ).pack(side="left", padx=8, pady=4)
+        ttk.Radiobutton(
+            scope_frame, text="Google + есть показы GSC",
+            variable=self.product_scope_var, value="google_impressions",
+        ).pack(side="left", padx=8, pady=4)
+
         btn_frame = ttk.Frame(run_frame)
-        btn_frame.grid(row=1, column=0, columnspan=4, pady=(4, 4))
+        btn_frame.grid(row=2, column=0, columnspan=4, pady=(4, 4))
 
         self.review_btn = ttk.Button(btn_frame, text="Сгенерировать описания", command=self._start_review)
         self.review_btn.pack(side="left", padx=4)
@@ -258,7 +274,7 @@ class App:
         self.indexnow_btn.pack(side="left", padx=4)
 
         btn_frame2 = ttk.Frame(run_frame)
-        btn_frame2.grid(row=2, column=0, columnspan=4, pady=(0, 8))
+        btn_frame2.grid(row=3, column=0, columnspan=4, pady=(0, 8))
 
         self.edit_prompt_btn = ttk.Button(btn_frame2, text="Редактировать промпт", command=self._open_prompt_editor)
         self.edit_prompt_btn.pack(side="left", padx=4)
@@ -361,6 +377,18 @@ class App:
 
     # ---------------------------------------------------------- Запуск задач
 
+    def _product_scope(self):
+        scope = self.product_scope_var.get().strip() if hasattr(self, "product_scope_var") else "all"
+        if scope not in {"all", "google_indexable", "google_impressions"}:
+            scope = "all"
+        return scope
+
+    def _product_report_filename(self, section):
+        scope = self._product_scope()
+        if scope == "all":
+            return f"ai_desc_report_section_{section}.json"
+        return f"ai_desc_report_section_{section}_{scope}.json"
+
     def _start_review(self):
         section = self.section_var.get().strip()
         if not section:
@@ -370,6 +398,7 @@ class App:
         inner_cmd = f"php ai_generate_descriptions_oc.php review {section}"
         if limit:
             inner_cmd += f" {limit}"
+        inner_cmd += f" --scope={self._product_scope()}"
         self._start_remote_job("review", section, inner_cmd)
 
     def _start_apply(self):
@@ -377,7 +406,7 @@ class App:
         if not section:
             messagebox.showerror("Ошибка", "Укажи ID раздела.")
             return
-        inner_cmd = f"php ai_generate_descriptions_oc.php apply {section}"
+        inner_cmd = f"php ai_generate_descriptions_oc.php apply {section} --scope={self._product_scope()}"
         self._start_remote_job("apply", section, inner_cmd)
 
     def _start_remote_job(self, job_type, section, inner_cmd):
@@ -544,7 +573,7 @@ class App:
         if not section:
             messagebox.showerror("Ошибка", "Укажи ID раздела.")
             return
-        inner_cmd = f"php ai_generate_descriptions_oc.php indexnow {section}"
+        inner_cmd = f"php ai_generate_descriptions_oc.php indexnow {section} --scope={self._product_scope()}"
         self._start_remote_job("indexnow", section, inner_cmd)
 
     def _check_count(self):
@@ -570,13 +599,13 @@ class App:
         self.check_btn.configure(state="disabled")
         thread = threading.Thread(
             target=self._check_count_worker,
-            args=(host, port, user, password, remote_path, section),
+            args=(host, port, user, password, remote_path, section, self._product_scope()),
             daemon=True,
         )
         thread.start()
 
-    def _check_count_worker(self, host, port, user, password, remote_path, section):
-        cmd = f"cd {remote_path} && php ai_generate_descriptions_oc.php count {section}"
+    def _check_count_worker(self, host, port, user, password, remote_path, section, scope):
+        cmd = f"cd {remote_path} && php ai_generate_descriptions_oc.php count {section} --scope={scope}"
         client = None
         try:
             client = self._connect(host, port, user, password)
@@ -647,7 +676,7 @@ class App:
         client = None
         try:
             client = self._connect(host, port, user, password)
-            report_file = f"{remote_path}/ai_desc_report_section_{section}.json"
+            report_file = f"{remote_path}/{self._product_report_filename(section)}"
             cmd = f"rm -f {report_file}"
             _, out, err = client.exec_command(cmd)
             out.channel.recv_exit_status()
@@ -697,7 +726,7 @@ class App:
         if not conn:
             return
         host, port, user, password, remote_path = conn
-        filename = f"ai_desc_report_section_{section}.json"
+        filename = self._product_report_filename(section)
         ReportViewerWindow(self, host, port, user, password, remote_path, filename)
 
     def _view_ocfilter_report(self):
