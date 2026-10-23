@@ -273,6 +273,11 @@ class App:
         self.indexnow_btn = ttk.Button(btn_frame, text="Отправить в IndexNow", command=self._start_indexnow)
         self.indexnow_btn.pack(side="left", padx=4)
 
+        self.google_refresh_btn = ttk.Button(
+            btn_frame, text="Сообщить Google об обновлении", command=self._start_google_refresh
+        )
+        self.google_refresh_btn.pack(side="left", padx=4)
+
         btn_frame2 = ttk.Frame(run_frame)
         btn_frame2.grid(row=3, column=0, columnspan=4, pady=(0, 8))
 
@@ -369,6 +374,7 @@ class App:
         self.review_btn.configure(state="normal")
         self.apply_btn.configure(state="normal")
         self.indexnow_btn.configure(state="normal")
+        self.google_refresh_btn.configure(state="normal")
         self.ocfilter_gen_btn.configure(state="normal")
         self.ocfilter_apply_btn.configure(state="normal")
         self.ocfilter_indexnow_btn.configure(state="normal")
@@ -436,6 +442,7 @@ class App:
         self.review_btn.configure(state="disabled")
         self.apply_btn.configure(state="disabled")
         self.indexnow_btn.configure(state="disabled")
+        self.google_refresh_btn.configure(state="disabled")
         self.ocfilter_gen_btn.configure(state="disabled")
         self.ocfilter_apply_btn.configure(state="disabled")
         self.ocfilter_indexnow_btn.configure(state="disabled")
@@ -575,6 +582,27 @@ class App:
             return
         inner_cmd = f"php ai_generate_descriptions_oc.php indexnow {section} --scope={self._product_scope()}"
         self._start_remote_job("indexnow", section, inner_cmd)
+
+    def _start_google_refresh(self):
+        section = self.section_var.get().strip()
+        if not section:
+            messagebox.showerror("Ошибка", "Укажи ID раздела.")
+            return
+
+        if not messagebox.askyesno(
+            "Google Search Console",
+            "Повторно отправить sitemap_g.xml в Google Search Console для товаров, "
+            "которым уже записаны тексты (status=applied)?\n\n"
+            "Это не Google Indexing API: обычные товарные URL по одному не отправляются. "
+            "Команда обновит сигнал через sitemap.",
+        ):
+            return
+
+        inner_cmd = (
+            f"php ai_generate_descriptions_oc.php googlerefresh {section} "
+            f"--scope={self._product_scope()}"
+        )
+        self._start_remote_job("googlerefresh", section, inner_cmd)
 
     def _check_count(self):
         section = self.section_var.get().strip()
