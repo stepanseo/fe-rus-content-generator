@@ -224,7 +224,7 @@ class App:
         self._build_ocfilter_tab(ocfilter_tab)
 
     def _build_products_tab(self, parent):
-        run_frame = ttk.LabelFrame(parent, text="Запуск генерации")
+        run_frame = ttk.LabelFrame(parent, text="Товары — основной процесс")
         run_frame.pack(fill="x", padx=0, pady=8)
 
         ttk.Label(run_frame, text="ID раздела:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
@@ -233,7 +233,7 @@ class App:
         section_entry.grid(row=0, column=1, padx=4, pady=4)
         setup_text_editing_shortcuts(section_entry)
 
-        ttk.Label(run_frame, text="Лимит товаров (необязательно):").grid(row=0, column=2, sticky="e", padx=4, pady=4)
+        ttk.Label(run_frame, text="Лимит (необязательно):").grid(row=0, column=2, sticky="e", padx=4, pady=4)
         self.limit_var = tk.StringVar()
         limit_entry = ttk.Entry(run_frame, textvariable=self.limit_var, width=8)
         limit_entry.grid(row=0, column=3, padx=4, pady=4)
@@ -242,69 +242,44 @@ class App:
         scope_frame = ttk.LabelFrame(run_frame, text="Какие товары обрабатывать")
         scope_frame.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 6))
         self.product_scope_var = tk.StringVar(value="all")
-        ttk.Radiobutton(
-            scope_frame, text="Все товары категории",
-            variable=self.product_scope_var, value="all",
-        ).pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(
-            scope_frame, text="Только открытые для Google",
-            variable=self.product_scope_var, value="google_indexable",
-        ).pack(side="left", padx=8, pady=4)
-        ttk.Radiobutton(
-            scope_frame, text="Google + есть показы GSC",
-            variable=self.product_scope_var, value="google_impressions",
-        ).pack(side="left", padx=8, pady=4)
+        ttk.Radiobutton(scope_frame, text="Все товары категории", variable=self.product_scope_var, value="all").pack(side="left", padx=8, pady=4)
+        ttk.Radiobutton(scope_frame, text="Только открытые для Google", variable=self.product_scope_var, value="google_indexable").pack(side="left", padx=8, pady=4)
+        ttk.Radiobutton(scope_frame, text="Google + есть показы GSC", variable=self.product_scope_var, value="google_impressions").pack(side="left", padx=8, pady=4)
 
-        btn_frame = ttk.Frame(run_frame)
-        btn_frame.grid(row=2, column=0, columnspan=4, pady=(4, 4))
-
-        self.review_btn = ttk.Button(btn_frame, text="Сгенерировать описания", command=self._start_review)
+        primary = ttk.Frame(run_frame)
+        primary.grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 6))
+        self.review_btn = ttk.Button(primary, text="1. Сгенерировать", command=self._start_review)
         self.review_btn.pack(side="left", padx=4)
-
-        self.apply_btn = ttk.Button(btn_frame, text="Записать на сайт (apply)", command=self._start_apply)
+        self.apply_btn = ttk.Button(primary, text="2. Записать на сайт", command=self._start_apply)
         self.apply_btn.pack(side="left", padx=4)
-
-        self.stop_btn = ttk.Button(btn_frame, text="Прекратить слежение", command=self._stop, state="disabled")
+        self.view_report_btn = ttk.Button(primary, text="Посмотреть тексты", command=self._view_products_report)
+        self.view_report_btn.pack(side="left", padx=4)
+        self.stop_btn = ttk.Button(primary, text="Стоп", command=self._stop, state="disabled")
         self.stop_btn.pack(side="left", padx=4)
 
-        self.check_btn = ttk.Button(btn_frame, text="Проверить кол-во сгенерированных", command=self._check_count)
-        self.check_btn.pack(side="left", padx=4)
+        relink = ttk.LabelFrame(run_frame, text="Перелинковка уже существующих текстов")
+        relink.grid(row=3, column=0, columnspan=4, sticky="ew", padx=8, pady=(2, 6))
+        ttk.Label(relink, text="ИИ не переписывает текст — только оборачивает подходящие фразы ссылками.").pack(side="left", padx=(8, 12), pady=5)
+        self.relink_review_btn = ttk.Button(relink, text="1. Подготовить ссылки", command=self._start_relink_review)
+        self.relink_review_btn.pack(side="left", padx=4, pady=4)
+        self.relink_apply_btn = ttk.Button(relink, text="2. Применить", command=self._start_relink_apply)
+        self.relink_apply_btn.pack(side="left", padx=4, pady=4)
 
-        self.indexnow_btn = ttk.Button(btn_frame, text="Отправить в IndexNow", command=self._start_indexnow)
-        self.indexnow_btn.pack(side="left", padx=4)
-
-        self.google_refresh_btn = ttk.Button(
-            btn_frame, text="Сообщить Google об обновлении", command=self._start_google_refresh
-        )
-        self.google_refresh_btn.pack(side="left", padx=4)
-
-        btn_frame2 = ttk.Frame(run_frame)
-        btn_frame2.grid(row=3, column=0, columnspan=4, pady=(0, 8))
-
-        self.edit_prompt_btn = ttk.Button(btn_frame2, text="Редактировать промпт", command=self._open_prompt_editor)
-        self.edit_prompt_btn.pack(side="left", padx=4)
-
-        self.delete_report_btn = ttk.Button(
-            btn_frame2, text="Удалить текущие тексты (для полной перегенерации)",
-            command=self._delete_report,
-        )
-        self.delete_report_btn.pack(side="left", padx=4)
-
-        self.view_report_btn = ttk.Button(
-            btn_frame2, text="Посмотреть тексты", command=self._view_products_report,
-        )
-        self.view_report_btn.pack(side="left", padx=4)
-
-        self.ready_ids_btn = ttk.Button(
-            btn_frame2, text="Просмотр ID с готовыми текстами",
-            command=lambda: self._open_ready_ids_window("products"),
-        )
-        self.ready_ids_btn.pack(side="left", padx=4)
-
-        self.buildlinks_btn = ttk.Button(
-            btn_frame2, text="Обновить перелинковку", command=self._start_buildlinks,
-        )
-        self.buildlinks_btn.pack(side="left", padx=4)
+        service = ttk.Frame(run_frame)
+        service.grid(row=4, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 8))
+        self.products_more_btn = ttk.Menubutton(service, text="Дополнительно ▾")
+        product_menu = tk.Menu(self.products_more_btn, tearoff=0)
+        product_menu.add_command(label="Редактировать промпт", command=self._open_prompt_editor)
+        product_menu.add_command(label="Проверить количество сгенерированных", command=self._check_count)
+        product_menu.add_command(label="Просмотр ID с готовыми текстами", command=lambda: self._open_ready_ids_window("products"))
+        product_menu.add_separator()
+        product_menu.add_command(label="Обновить каталог перелинковки", command=self._start_buildlinks)
+        product_menu.add_command(label="Сообщить Google об обновлении", command=self._start_google_refresh)
+        product_menu.add_command(label="Отправить в IndexNow", command=self._start_indexnow)
+        product_menu.add_separator()
+        product_menu.add_command(label="Удалить текущий отчёт / перегенерация", command=self._delete_report)
+        self.products_more_btn["menu"] = product_menu
+        self.products_more_btn.pack(side="left")
 
     def _build_shared_status_and_log(self):
         # Статус и лог — общие для обеих вкладок (и генерация текста
@@ -376,15 +351,11 @@ class App:
     def _finish_run(self):
         self.running = False
         self.stop_requested = False
-        self.review_btn.configure(state="normal")
-        self.apply_btn.configure(state="normal")
-        self.indexnow_btn.configure(state="normal")
-        self.google_refresh_btn.configure(state="normal")
-        self.buildlinks_btn.configure(state="normal")
-        self.ocfilter_gen_btn.configure(state="normal")
-        self.ocfilter_apply_btn.configure(state="normal")
-        self.ocfilter_indexnow_btn.configure(state="normal")
-        self.ocfilter_buildlinks_btn.configure(state="normal")
+        for name in ("review_btn", "apply_btn", "relink_review_btn", "relink_apply_btn",
+                     "ocfilter_gen_btn", "ocfilter_apply_btn", "ocfilter_relink_review_btn", "ocfilter_relink_apply_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Готово")
 
@@ -422,6 +393,28 @@ class App:
         inner_cmd = f"php ai_generate_descriptions_oc.php apply {section} --scope={self._product_scope()}"
         self._start_remote_job("apply", section, inner_cmd)
 
+    def _start_relink_review(self):
+        section = self.section_var.get().strip()
+        if not section:
+            messagebox.showerror("Ошибка", "Укажи ID раздела.")
+            return
+        limit = self.limit_var.get().strip()
+        inner_cmd = f"php ai_generate_descriptions_oc.php relinkreview {section}"
+        if limit:
+            inner_cmd += f" {limit}"
+        inner_cmd += f" --scope={self._product_scope()}"
+        self._start_remote_job("relinkreview", section, inner_cmd)
+
+    def _start_relink_apply(self):
+        section = self.section_var.get().strip()
+        if not section:
+            messagebox.showerror("Ошибка", "Укажи ID раздела.")
+            return
+        if not messagebox.askyesno("Применить перелинковку", "Записать подготовленные ссылки в существующие описания товаров? Текст при этом не переписывается."):
+            return
+        inner_cmd = f"php ai_generate_descriptions_oc.php relinkapply {section} --scope={self._product_scope()}"
+        self._start_remote_job("relinkapply", section, inner_cmd)
+
     def _start_remote_job(self, job_type, section, inner_cmd):
         if paramiko is None:
             messagebox.showerror("Ошибка", "Не установлен модуль paramiko (pip install paramiko).")
@@ -446,15 +439,11 @@ class App:
 
         self.running = True
         self.stop_requested = False
-        self.review_btn.configure(state="disabled")
-        self.apply_btn.configure(state="disabled")
-        self.indexnow_btn.configure(state="disabled")
-        self.google_refresh_btn.configure(state="disabled")
-        self.buildlinks_btn.configure(state="disabled")
-        self.ocfilter_gen_btn.configure(state="disabled")
-        self.ocfilter_apply_btn.configure(state="disabled")
-        self.ocfilter_indexnow_btn.configure(state="disabled")
-        self.ocfilter_buildlinks_btn.configure(state="disabled")
+        for name in ("review_btn", "apply_btn", "relink_review_btn", "relink_apply_btn",
+                     "ocfilter_gen_btn", "ocfilter_apply_btn", "ocfilter_relink_review_btn", "ocfilter_relink_apply_btn"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_var.set("Запускаю на сервере...")
         self._append_log(f"\n$ (в фоне на сервере) {inner_cmd}\n")
@@ -643,7 +632,8 @@ class App:
             messagebox.showerror("Ошибка", "Заполни хост, логин и путь к скрипту в блоке подключения.")
             return
 
-        self.check_btn.configure(state="disabled")
+        if hasattr(self, "check_btn"):
+            self.check_btn.configure(state="disabled")
         thread = threading.Thread(
             target=self._check_count_worker,
             args=(host, port, user, password, remote_path, section, self._product_scope()),
@@ -671,7 +661,8 @@ class App:
                     client.close()
             except Exception:
                 pass
-            self.root.after(0, lambda: self.check_btn.configure(state="normal"))
+            if hasattr(self, "check_btn"):
+                self.root.after(0, lambda: self.check_btn.configure(state="normal"))
 
     def _stop(self):
         self.stop_requested = True
@@ -823,121 +814,64 @@ class App:
     # ---------------------------------------------------------- Вкладка "Создание SEO-страниц" (OCFilter)
 
     def _build_ocfilter_tab(self, parent):
-        # Поля и кнопки — сразу сверху, без прокрутки мимо длинного текста;
-        # пояснения по формату и сам список страниц — ниже, внизу вкладки.
-        id_frame = ttk.Frame(parent)
+        id_frame = ttk.LabelFrame(parent, text="SEO-страницы — основной процесс")
         id_frame.pack(fill="x", pady=(8, 6))
-        ttk.Label(id_frame, text="ID партии (для файлов отчёта):").pack(side="left")
+        top = ttk.Frame(id_frame)
+        top.pack(fill="x", padx=8, pady=6)
+        ttk.Label(top, text="ID партии:").pack(side="left")
         self.ocfilter_batch_var = tk.StringVar()
-        ocfilter_batch_entry = ttk.Entry(id_frame, textvariable=self.ocfilter_batch_var, width=12)
+        ocfilter_batch_entry = ttk.Entry(top, textvariable=self.ocfilter_batch_var, width=12)
         ocfilter_batch_entry.pack(side="left", padx=6)
         setup_text_editing_shortcuts(ocfilter_batch_entry)
-
-        ttk.Label(id_frame, text="Лимит страниц за прогон (необязательно):").pack(side="left", padx=(16, 0))
+        ttk.Label(top, text="Лимит (необязательно):").pack(side="left", padx=(16, 0))
         self.ocfilter_limit_var = tk.StringVar()
-        ocfilter_limit_entry = ttk.Entry(id_frame, textvariable=self.ocfilter_limit_var, width=8)
+        ocfilter_limit_entry = ttk.Entry(top, textvariable=self.ocfilter_limit_var, width=8)
         ocfilter_limit_entry.pack(side="left", padx=6)
         setup_text_editing_shortcuts(ocfilter_limit_entry)
 
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(pady=(0, 4))
-
-        self.ocfilter_gen_btn = ttk.Button(
-            btn_frame, text="Сгенерировать SEO-страницы", command=self._start_ocfilter_gen
-        )
+        primary = ttk.Frame(id_frame)
+        primary.pack(fill="x", padx=8, pady=(0, 6))
+        self.ocfilter_gen_btn = ttk.Button(primary, text="1. Сгенерировать SEO-тексты", command=self._start_ocfilter_gen)
         self.ocfilter_gen_btn.pack(side="left", padx=4)
-
-        self.ocfilter_apply_btn = ttk.Button(
-            btn_frame, text="Записать на сайт (apply)", command=self._start_ocfilter_apply
-        )
+        self.ocfilter_apply_btn = ttk.Button(primary, text="2. Записать на сайт", command=self._start_ocfilter_apply)
         self.ocfilter_apply_btn.pack(side="left", padx=4)
-
-        self.ocfilter_check_btn = ttk.Button(
-            btn_frame, text="Проверить кол-во", command=self._ocfilter_check_count
-        )
-        self.ocfilter_check_btn.pack(side="left", padx=4)
-
-        btn_frame2 = ttk.Frame(parent)
-        btn_frame2.pack(pady=(0, 8))
-
-        # Отдельная РУЧНАЯ кнопка IndexNow — намеренно не вызывается сама
-        # после apply, т.к. модуль ещё тестируется и страницы не должны
-        # автоматически улетать в IndexNow при каждой записи на сайт.
-        self.ocfilter_indexnow_btn = ttk.Button(
-            btn_frame2, text="Отправить в IndexNow", command=self._start_ocfilter_indexnow
-        )
-        self.ocfilter_indexnow_btn.pack(side="left", padx=4)
-
-        self.ocfilter_edit_prompt_btn = ttk.Button(
-            btn_frame2, text="Редактировать промпт SEO-страниц", command=self._open_ocfilter_prompt_editor
-        )
-        self.ocfilter_edit_prompt_btn.pack(side="left", padx=4)
-
-        self.ocfilter_delete_report_btn = ttk.Button(
-            btn_frame2, text="Удалить текущий отчёт (для полной перегенерации)",
-            command=self._delete_ocfilter_report,
-        )
-        self.ocfilter_delete_report_btn.pack(side="left", padx=4)
-
-        self.ocfilter_view_report_btn = ttk.Button(
-            btn_frame2, text="Посмотреть тексты", command=self._view_ocfilter_report,
-        )
+        self.ocfilter_view_report_btn = ttk.Button(primary, text="Посмотреть тексты", command=self._view_ocfilter_report)
         self.ocfilter_view_report_btn.pack(side="left", padx=4)
 
-        self.ocfilter_ready_ids_btn = ttk.Button(
-            btn_frame2, text="Просмотр ID SEO-страниц с готовыми текстами",
-            command=lambda: self._open_ready_ids_window("ocfilter"),
-        )
-        self.ocfilter_ready_ids_btn.pack(side="left", padx=4)
+        relink = ttk.LabelFrame(id_frame, text="Перелинковка уже существующих SEO-текстов")
+        relink.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(relink, text="Работает по списку страниц ниже; основной текст и meta-поля не переписываются.").pack(side="left", padx=(8, 12), pady=5)
+        self.ocfilter_relink_review_btn = ttk.Button(relink, text="1. Подготовить ссылки", command=self._start_ocfilter_relink_review)
+        self.ocfilter_relink_review_btn.pack(side="left", padx=4, pady=4)
+        self.ocfilter_relink_apply_btn = ttk.Button(relink, text="2. Применить", command=self._start_ocfilter_relink_apply)
+        self.ocfilter_relink_apply_btn.pack(side="left", padx=4, pady=4)
 
-        self.ocfilter_buildlinks_btn = ttk.Button(
-            btn_frame2, text="Обновить перелинковку", command=self._start_buildlinks,
-        )
-        self.ocfilter_buildlinks_btn.pack(side="left", padx=4)
+        service = ttk.Frame(id_frame)
+        service.pack(fill="x", padx=8, pady=(0, 8))
+        self.ocfilter_more_btn = ttk.Menubutton(service, text="Дополнительно ▾")
+        oc_menu = tk.Menu(self.ocfilter_more_btn, tearoff=0)
+        oc_menu.add_command(label="Редактировать промпт SEO-страниц", command=self._open_ocfilter_prompt_editor)
+        oc_menu.add_command(label="Проверить количество", command=self._ocfilter_check_count)
+        oc_menu.add_command(label="Просмотр ID SEO-страниц с готовыми текстами", command=lambda: self._open_ready_ids_window("ocfilter"))
+        oc_menu.add_separator()
+        oc_menu.add_command(label="Обновить каталог перелинковки", command=self._start_buildlinks)
+        oc_menu.add_command(label="Отправить в IndexNow", command=self._start_ocfilter_indexnow)
+        oc_menu.add_separator()
+        oc_menu.add_command(label="Удалить текущий отчёт / перегенерация", command=self._delete_ocfilter_report)
+        self.ocfilter_more_btn["menu"] = oc_menu
+        self.ocfilter_more_btn.pack(side="left")
 
         list_frame = ttk.LabelFrame(parent, text="Список SEO-страниц (одна строка — одна страница)")
         list_frame.pack(fill="both", expand=True, pady=(4, 4))
         self.ocfilter_urls_text = scrolledtext.ScrolledText(list_frame, wrap="none", height=8, font=("Consolas", 9))
         self.ocfilter_urls_text.pack(fill="both", expand=True, padx=4, pady=4)
-        # Copy/paste/select-all по физическому коду клавиши — без этого
-        # Ctrl+C/V/A может не срабатывать при русской раскладке клавиатуры
-        # (та же функция уже используется в редакторе промптов).
         setup_text_editing_shortcuts(self.ocfilter_urls_text)
 
         info = (
-            "Можно вставлять прямо готовые ссылки на страницы (по одной в строке) —\n"
-            "категория, KEYWORD и параметры фильтра определятся из адреса автоматически:\n"
-            "   https://fe-rus.ru/list-stalnoj-gladkij/marka/r6m5/\n"
-            "   https://fe-rus.ru/list-stalnoj-gladkij/marka/s355-5/\n"
-            "\n"
-            "Либо (если нужен другой адрес страницы, чем в ссылке) — явный формат\n"
-            "KEYWORD;CATEGORY;PARAMS:\n"
-            "   KEYWORD  — желаемый адрес страницы, напр. armatura-stal-09g2s\n"
-            "   CATEGORY — ID категории (число) или её адрес (слаг) в URL сайта\n"
-            "   PARAMS   — параметры фильтра из адреса, напр. marka/09g2s\n"
-            "Пример:\n"
-            "   armatura-stal-09g2s;121;marka/09g2s\n"
-            "   shina-med-m1-shmm;145;marka/m1/tip/shmm"
+            "Можно вставлять готовые ссылки на страницы (по одной в строке). Для перелинковки существующих SEO-текстов используется тот же список.\n"
+            "Пример: https://fe-rus.ru/list-stalnoj-gladkij/marka/r6m5/\n"
         )
-        ttk.Label(parent, text=info, justify="left", foreground="#555555").pack(
-            anchor="w", padx=0, pady=(0, 8)
-        )
-
-    def _upload_ocfilter_urls(self, conn, batch):
-        """Заливает содержимое текстового поля на сервер в
-        ocfilter_urls_batch_{batch}.txt через SFTP — PHP-скрипт читает
-        именно этот файл при запуске genocfilter."""
-        host, port, user, password, remote_path = conn
-        content = self.ocfilter_urls_text.get("1.0", "end-1c")
-        client = self._connect(host, port, user, password)
-        try:
-            sftp = client.open_sftp()
-            remote_file = f"{remote_path}/ocfilter_urls_batch_{batch}.txt"
-            with sftp.open(remote_file, "w") as f:
-                f.write(content.encode("utf-8"))
-            sftp.close()
-        finally:
-            client.close()
+        ttk.Label(parent, text=info, justify="left", foreground="#444").pack(anchor="w", padx=4, pady=(0, 6))
 
     def _start_ocfilter_gen(self):
         batch = self.ocfilter_batch_var.get().strip()
@@ -964,6 +898,38 @@ class App:
             inner_cmd += f" {limit}"
         self._start_remote_job("genocfilter", batch, inner_cmd)
 
+    def _start_ocfilter_relink_review(self):
+        batch = self.ocfilter_batch_var.get().strip()
+        if not batch:
+            messagebox.showerror("Ошибка", "Укажи ID партии.")
+            return
+        if not self.ocfilter_urls_text.get("1.0", "end-1c").strip():
+            messagebox.showerror("Ошибка", "Список SEO-страниц пуст.")
+            return
+        conn = self._get_conn_params_or_error()
+        if not conn:
+            return
+        try:
+            self._upload_ocfilter_urls(conn, batch)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список страниц на сервер: {e}")
+            return
+        limit = self.ocfilter_limit_var.get().strip()
+        inner_cmd = f"php ai_generate_descriptions_oc.php relinkocfilterreview {batch}"
+        if limit:
+            inner_cmd += f" {limit}"
+        self._start_remote_job("relinkocfilterreview", batch, inner_cmd)
+
+    def _start_ocfilter_relink_apply(self):
+        batch = self.ocfilter_batch_var.get().strip()
+        if not batch:
+            messagebox.showerror("Ошибка", "Укажи ID партии.")
+            return
+        if not messagebox.askyesno("Применить перелинковку", "Записать подготовленные ссылки в существующие SEO-тексты? Meta title/H1/meta description не меняются."):
+            return
+        inner_cmd = f"php ai_generate_descriptions_oc.php relinkocfilterapply {batch}"
+        self._start_remote_job("relinkocfilterapply", batch, inner_cmd)
+
     def _start_ocfilter_apply(self):
         batch = self.ocfilter_batch_var.get().strip()
         if not batch:
@@ -988,7 +954,8 @@ class App:
         conn = self._get_conn_params_or_error()
         if not conn:
             return
-        self.ocfilter_check_btn.configure(state="disabled")
+        if hasattr(self, "ocfilter_check_btn"):
+            self.ocfilter_check_btn.configure(state="disabled")
         thread = threading.Thread(
             target=self._ocfilter_check_count_worker, args=(conn, batch), daemon=True
         )
@@ -1015,7 +982,8 @@ class App:
                     client.close()
             except Exception:
                 pass
-            self.root.after(0, lambda: self.ocfilter_check_btn.configure(state="normal"))
+            if hasattr(self, "ocfilter_check_btn"):
+                self.root.after(0, lambda: self.ocfilter_check_btn.configure(state="normal"))
 
     def _delete_ocfilter_report(self):
         batch = self.ocfilter_batch_var.get().strip()
