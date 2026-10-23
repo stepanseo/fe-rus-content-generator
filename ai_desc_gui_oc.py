@@ -301,6 +301,11 @@ class App:
         )
         self.ready_ids_btn.pack(side="left", padx=4)
 
+        self.buildlinks_btn = ttk.Button(
+            btn_frame2, text="Обновить перелинковку", command=self._start_buildlinks,
+        )
+        self.buildlinks_btn.pack(side="left", padx=4)
+
     def _build_shared_status_and_log(self):
         # Статус и лог — общие для обеих вкладок (и генерация текста
         # товаров, и создание SEO-страниц используют один и тот же механизм
@@ -375,9 +380,11 @@ class App:
         self.apply_btn.configure(state="normal")
         self.indexnow_btn.configure(state="normal")
         self.google_refresh_btn.configure(state="normal")
+        self.buildlinks_btn.configure(state="normal")
         self.ocfilter_gen_btn.configure(state="normal")
         self.ocfilter_apply_btn.configure(state="normal")
         self.ocfilter_indexnow_btn.configure(state="normal")
+        self.ocfilter_buildlinks_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("Готово")
 
@@ -443,9 +450,11 @@ class App:
         self.apply_btn.configure(state="disabled")
         self.indexnow_btn.configure(state="disabled")
         self.google_refresh_btn.configure(state="disabled")
+        self.buildlinks_btn.configure(state="disabled")
         self.ocfilter_gen_btn.configure(state="disabled")
         self.ocfilter_apply_btn.configure(state="disabled")
         self.ocfilter_indexnow_btn.configure(state="disabled")
+        self.ocfilter_buildlinks_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_var.set("Запускаю на сервере...")
         self._append_log(f"\n$ (в фоне на сервере) {inner_cmd}\n")
@@ -574,6 +583,16 @@ class App:
                 pass
             self.ssh_client = None
             self.output_queue.put(None)
+
+    def _start_buildlinks(self):
+        if not messagebox.askyesno(
+            "Внутренняя перелинковка",
+            "Пересобрать из базы каталог активных разделов и SEO-страниц OCFilter?\n\n"
+            "Он используется автоматически при генерации товаров и SEO-страниц.",
+        ):
+            return
+        inner_cmd = "php ai_generate_descriptions_oc.php buildlinks"
+        self._start_remote_job("buildlinks", "catalog", inner_cmd)
 
     def _start_indexnow(self):
         section = self.section_var.get().strip()
@@ -870,6 +889,11 @@ class App:
             command=lambda: self._open_ready_ids_window("ocfilter"),
         )
         self.ocfilter_ready_ids_btn.pack(side="left", padx=4)
+
+        self.ocfilter_buildlinks_btn = ttk.Button(
+            btn_frame2, text="Обновить перелинковку", command=self._start_buildlinks,
+        )
+        self.ocfilter_buildlinks_btn.pack(side="left", padx=4)
 
         list_frame = ttk.LabelFrame(parent, text="Список SEO-страниц (одна строка — одна страница)")
         list_frame.pack(fill="both", expand=True, pady=(4, 4))
@@ -1263,6 +1287,26 @@ class PromptEditorTab(ttk.Frame):
         self.info_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.info_var, foreground="blue").pack(anchor="w", padx=12)
 
+        links_frame = ttk.LabelFrame(self, text="Внутренняя перелинковка")
+        links_frame.pack(fill="x", padx=10, pady=(6, 2))
+        ttk.Label(links_frame, text="Максимум ссылок:").pack(side="left", padx=(8, 4), pady=6)
+        self.internal_links_max_var = tk.StringVar(value="3")
+        self.internal_links_max_spin = ttk.Spinbox(
+            links_frame, from_=0, to=10, width=4, textvariable=self.internal_links_max_var
+        )
+        self.internal_links_max_spin.pack(side="left", padx=(0, 8), pady=6)
+        ttk.Button(
+            links_frame, text="Вставить {{INTERNAL_LINKS}}", command=self._insert_internal_links_placeholder
+        ).pack(side="left", padx=4, pady=6)
+        ttk.Button(
+            links_frame, text="Подсказка", command=self._show_internal_links_help
+        ).pack(side="left", padx=4, pady=6)
+        ttk.Label(
+            links_frame,
+            text="0 = без ссылок; обычно 1-3. Лимит контролируется PHP после генерации.",
+            foreground="#555555",
+        ).pack(side="left", padx=8, pady=6)
+
         self.text_area = scrolledtext.ScrolledText(self, wrap="word", font=("Consolas", 10))
         self.text_area.pack(fill="both", expand=True, padx=10, pady=8)
         setup_text_editing_shortcuts(self.text_area)
@@ -1272,6 +1316,59 @@ class PromptEditorTab(ttk.Frame):
         ttk.Label(self, text=hint_text, wraplength=760, foreground="#555555").pack(anchor="w", padx=12, pady=(0, 8))
 
         self._refresh_file_list(preselect_for_section=section)
+
+    def _get_internal_links_max(self):
+        try:
+            value = int(self.internal_links_max_var.get().strip())
+        except Exception:
+            value = 3
+        value = max(0, min(10, value))
+        self.internal_links_max_var.set(str(value))
+        return value
+
+    def _insert_internal_links_placeholder(self):
+        max_links = self._get_internal_links_max()
+        placeholder = f"{{{{INTERNAL_LINKS:{max_links}}}}}"
+
+        # Если в промпте уже есть плейсхолдер перелинковки — просто меняем
+        # лимит, не создавая второй блок.
+        text = self.text_area.get("1.0", "end-1c")
+        import re
+        pattern = r"\{\{INTERNAL_LINKS(?:\s*:\s*\d+)?\s*\}\}"
+        if re.search(pattern, text, flags=re.I):
+            text = re.sub(pattern, placeholder, text, count=1, flags=re.I)
+            self.text_area.delete("1.0", "end")
+            self.text_area.insert("1.0", text)
+            self.info_var.set(f"Обновлён плейсхолдер перелинковки: {placeholder}")
+            return
+
+        insert_text = (
+            "\n\nВнутренняя перелинковка:\n"
+            f"{placeholder}\n"
+        )
+        try:
+            pos = self.text_area.index("insert")
+            self.text_area.insert(pos, insert_text)
+        except Exception:
+            self.text_area.insert("end", insert_text)
+        self.info_var.set(f"Вставлен {placeholder}. Сохрани промпт на сервер.")
+
+    def _show_internal_links_help(self):
+        help_text = (
+            "Как использовать перелинковку в промпте:\n\n"
+            "1. Поставьте курсор в том месте промпта, где модели нужно получить список разрешённых ссылок.\n"
+            "2. Укажите 'Максимум ссылок' и нажмите «Вставить {{INTERNAL_LINKS}}».\n"
+            "3. В промпт вставится, например, {{INTERNAL_LINKS:3}}.\n\n"
+            "Во время генерации PHP заменит этот плейсхолдер на несколько релевантных разделов каталога и SEO-страниц. "
+            "Модель сможет использовать от 0 до указанного количества ссылок.\n\n"
+            "Рекомендуемая формулировка рядом с плейсхолдером:\n"
+            "«Добавляй внутренние ссылки только там, где они естественно дополняют текст. "
+            "Используй живые анкоры, распределяй ссылки по разным абзацам и не используй одну ссылку повторно. "
+            "Не придумывай URL — используй только разрешённые ссылки из блока ниже.»\n\n"
+            "Важно: PHP дополнительно проверяет href и снимает неизвестные ссылки. Если модель вставит ссылок больше лимита, лишние ссылки также будут сняты, а текст анкоров останется.\n\n"
+            "Для полного запрета ссылок укажите максимум 0: {{INTERNAL_LINKS:0}}."
+        )
+        messagebox.showinfo("Подсказка по перелинковке", help_text, parent=self)
 
     def _connect(self):
         client = paramiko.SSHClient()
@@ -1511,12 +1608,14 @@ class PromptEditorWindow(tk.Toplevel):
 
         product_hint = (
             "Плейсхолдеры, которые скрипт подставит автоматически: "
-            "{{NAME}} {{SECTION}} {{PROPS}} {{EXTRA_BLOCK}} {{REWRITE_BLOCK}} "
-            "(в rewrite_block.txt также доступен {{EXISTING_TEXT}}). Не удаляй их, если только не уверен."
+            "{{NAME}} {{SECTION}} {{PROPS}} {{EXTRA_BLOCK}} {{REWRITE_BLOCK}} и {{INTERNAL_LINKS:N}}, "
+            "где N — максимум внутренних ссылок (например {{INTERNAL_LINKS:3}}). "
+            "(в rewrite_block.txt также доступен {{EXISTING_TEXT}})."
         )
         ocfilter_hint = (
             "Плейсхолдеры, которые скрипт подставит автоматически: "
-            "{{CATEGORY_NAME}} {{PARAMS}} {{KEYWORD}}. Не удаляй их, если только не уверен. "
+            "{{CATEGORY_NAME}} {{PARAMS}} {{KEYWORD}} и {{INTERNAL_LINKS:N}}, "
+            "где N — максимум внутренних ссылок (например {{INTERNAL_LINKS:3}}). "
             "Если файла ещё нет на сервере — при первом запуске 'Сгенерировать SEO-страницы' "
             "будет создан default.txt автоматически со стартовым шаблоном."
         )
@@ -1529,6 +1628,7 @@ class PromptEditorWindow(tk.Toplevel):
             "Характеристики:\n"
             "{{PROPS}}\n"
             "{{EXTRA_BLOCK}}{{REWRITE_BLOCK}}\n"
+            "{{INTERNAL_LINKS:3}}\n"
             "Требования к тексту:\n"
             "1. Объём 300-500 слов, HTML-теги <h2>/<h3>/<p> (без markdown).\n"
             "2. Не выдумывай характеристики, которых нет в списке выше.\n"
@@ -1540,6 +1640,7 @@ class PromptEditorWindow(tk.Toplevel):
             "Категория: {{CATEGORY_NAME}}\n"
             "Параметры фильтра (технические, необязательно понятные без контекста): {{PARAMS}}\n"
             "Желаемый общий смысл страницы (заголовок H1 подбери сам, по-русски, коротко и по-товарному): {{KEYWORD}}\n\n"
+            "{{INTERNAL_LINKS:3}}\n"
             "Требования к тексту:\n"
             "1. Объём 150-300 слов, HTML-теги <p>/<h2> (без markdown, без <h1> — заголовок H1 сайт возьмёт из отдельного поля).\n"
             "2. Не выдумывай характеристики и ГОСТы, которых нет в параметрах фильтра или в названии категории.\n"

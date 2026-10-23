@@ -1,0 +1,3000 @@
+<?php
+/**
+ * ai_generate_descriptions_oc.php
+ *
+ * Версия скрипта массовой генерации описаний товаров для OcStore3 / OpenCart 3.x.
+ * По архитектуре и набору команд полностью аналогична версии для Битрикс —
+ * отличается только слоем доступа к данным (прямые SQL-запросы к таблицам
+ * OpenCart вместо API Битрикса).
+ *
+ * ВАЖНО — требует проверки под конкретную установку:
+ *   - LANGUAGE_ID: обычно 1, но нужно свериться (SELECT * FROM oc_language)
+ *   - DB_PREFIX: обычно "oc_", но могло быть изменено при установке
+ *   - Схема oc_seo_url: в разных версиях/форках разная (см. функцию getProductUrl)
+ *
+ * Запуск (идентично Bitrix-версии):
+ *   php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT] [--scope=all|google_indexable|google_impressions]
+ *   php ai_generate_descriptions_oc.php apply  <CATEGORY_ID>
+ *   php ai_generate_descriptions_oc.php preview <CATEGORY_ID> <PRODUCT_ID>
+ *   php ai_generate_descriptions_oc.php dumpprompt <CATEGORY_ID> <PRODUCT_ID>
+ *   php ai_generate_descriptions_oc.php count <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]
+ *   php ai_generate_descriptions_oc.php listapplied <CATEGORY_ID>
+ *   php ai_generate_descriptions_oc.php listprompts
+ *   php ai_generate_descriptions_oc.php bindprompt <CATEGORY_ID> <FILENAME>
+ *   php ai_generate_descriptions_oc.php unbindprompt <CATEGORY_ID>
+ *   php ai_generate_descriptions_oc.php listmapping
+ *   php ai_generate_descriptions_oc.php indexnow <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]
+ *   php ai_generate_descriptions_oc.php googlerefresh <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]
+ *   php ai_generate_descriptions_oc.php buildlinks
+ *
+ *   Модуль OCFilter (SEO-страницы фильтров категорий):
+ *   php ai_generate_descriptions_oc.php genocfilter <BATCH_ID> [LIMIT]
+ *   php ai_generate_descriptions_oc.php applyocfilter <BATCH_ID>
+ *   php ai_generate_descriptions_oc.php countocfilter <BATCH_ID>
+ *   php ai_generate_descriptions_oc.php listappliedocfilter <BATCH_ID>
+ *   php ai_generate_descriptions_oc.php indexnowocfilter <BATCH_ID>
+ */
+
+// ==================== КОНФИГУРАЦИЯ ====================
+
+// Путь к корневому config.php интернет-магазина (там же, где index.php сайта).
+// В нём объявлены константы DB_HOSTNAME, DB_USERNAME, DB_PASSWORD, DB_DATABASE, DB_PREFIX.
+define("OC_CONFIG_PATH", "/var/www/fe-rus/data/www/fe-rus.ru/config.php");
+
+if (!file_exists(OC_CONFIG_PATH)) {
+    die("Не найден config.php OpenCart по пути: " . OC_CONFIG_PATH . "\nПропиши правильный путь в константе OC_CONFIG_PATH.\n");
+}
+require_once(OC_CONFIG_PATH);
+
+define("TBL_PREFIX", defined("DB_PREFIX") ? DB_PREFIX : "oc_");
+define("LANGUAGE_ID", 1); 
+define("STORE_ID", 0);   
+
+function getPdo()
+{
+    static $pdo = null;
+    if ($pdo === null) {
+        $pdo = new PDO(
+            "mysql:host=" . DB_HOSTNAME . ";dbname=" . DB_DATABASE . ";charset=utf8mb4",
+            DB_USERNAME,
+            DB_PASSWORD,
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+        );
+    }
+    return $pdo;
+}
+
+function reconnectDatabase()
+{
+    // В отличие от Bitrix-версии, здесь просто пересоздаём PDO-соединение.
+    global $__pdo_reset;
+    $__pdo_reset = true;
+}
+
+// Обёртка над getPdo(), которая учитывает флаг пересоздания соединения
+// (используется после обрыва MySQL-соединения на длинных прогонах).
+function db()
+{
+    global $__pdo_reset;
+    static $pdo = null;
+    if ($pdo === null || !empty($__pdo_reset)) {
+        $pdo = new PDO(
+            "mysql:host=" . DB_HOSTNAME . ";dbname=" . DB_DATABASE . ";charset=utf8mb4",
+            DB_USERNAME,
+            DB_PASSWORD,
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+        );
+        $__pdo_reset = false;
+    }
+    return $pdo;
+}
+
+// Папка с текстовыми файлами промптов — так же, как в Bitrix-версии.
+define("PROMPTS_DIR", __DIR__ . "/prompts");
+
+// Отдельная папка промптов для SEO-страниц OCFilter — не смешиваем с
+// промптами товаров, т.к. это принципиально другой тип текста (не карточка
+// товара, а страница фильтра категории).
+define("OCFILTER_PROMPTS_DIR", __DIR__ . "/prompts/ocfilter");
+
+$SECTION_PROMPT_FILES = loadSectionPromptFiles();
+
+$DEFAULT_SECTION_ID = null;
+
+// Ключ и модель — ТОЛЬКО из переменной окружения (передаётся GUI-приложением).
+define("ROUTER_CHEAP_API_KEY", getenv("ROUTER_CHEAP_API_KEY") ?: "");
+define("ROUTER_CHEAP_MODEL", getenv("ROUTER_CHEAP_MODEL") ?: "claude-sonnet-5");
+
+// IndexNow
+define("INDEXNOW_KEY", "f04e68d0e38cc17ebafe6ea66377e523");
+define("SITE_HOST", "fe-rus.ru"); // <-- ЗАПОЛНИ, например "fe-rus.ru"
+define("SITE_PROTOCOL", "https");
+
+// Google Search Console / Sitemap API. По умолчанию используем тот же service account,
+// что и Google Index Manager в соседней папке google_impressions.
+define("GOOGLE_SERVICE_ACCOUNT_JSON", __DIR__ . "/google_impressions/google-service-account.json");
+define("GOOGLE_WEBMASTERS_SCOPE", "https://www.googleapis.com/auth/webmasters");
+define("GOOGLE_MAIN_SITEMAP_PATH", "/sitemap/sitemap_g.xml");
+
+// Внутренняя перелинковка. Каталог строится из активных категорий и
+// активных SEO-страниц OCFilter и используется и для товаров, и для
+// SEO-страниц. href храним относительным, чтобы ссылка оставалась на том
+// же региональном поддомене (chita.fe-rus.ru, spb.fe-rus.ru и т.д.).
+define("INTERNAL_LINKS_CATALOG_FILE", __DIR__ . "/internal_links_catalog.json");
+define("INTERNAL_LINKS_CATALOG_TTL", 86400); // 24 часа
+define("INTERNAL_LINKS_MAX_CANDIDATES", 12);
+define("INTERNAL_LINKS_DEFAULT_MAX_LINKS", 3);
+
+// Фиксированный коммерческий блок, который приклеивается кодом (не ИИ)
+// в конец КАЖДОГО сгенерированного описания. Плейсхолдеры %CITY%/%PHONE%/
+// %EMAIL% — уже поддерживаются самим сайтом (см. product.php controller,
+// $data['description'] проходит через тот же str_replace, что и auto_description),
+// поэтому подставлять реальные значения самим не нужно — сайт сделает это
+// сам при отображении, в зависимости от домена/города.
+define("COMMERCIAL_FOOTER_HTML", <<<'FOOTER'
+<div style="margin-top: 20px;">
+<p>Налаживание надежных партнерских отношений, развитие логистической цепи, улучшение технологических процессов производства на промышленных объектах компании – это то, чему постоянно уделяется большое внимание.</p>
+
+<p>ООО Ферус, г. %CITY%, предлагает Вам приобрести по выгодной цене. Реализация продукции оптом и в розницу, с складов компании. Условия доставки и другую информацию, касательно покупки Вы можете уточнить у менеджеров компании по телефону или электронной почте:</p>
+
+<p><strong><a href="tel:%PHONE%">%PHONE%</a></strong></p>
+
+<p><strong><a href="mailto:%EMAIL%">%EMAIL%</a></strong></p>
+</div>
+FOOTER
+);
+// Коммерческий хвост для <title>/meta_title страниц OCFilter — приклеивается
+// кодом (не ИИ) после сгенерированной части "Категория с характеристикой",
+// гарантированно с правильными плейсхолдерами (сайт сам подставит нужный
+// город/контакты поддомена при отображении, см. product.php controller —
+// %CITYS%/%TELEPHONE%/%EMAIL% там реально обрабатываются str_replace).
+// %CITYS% — город в предложном падеже ("в Екатеринбурге"), не путать с
+// %CITY% (именительный падеж, "Екатеринбург").
+define("OCFILTER_TITLE_SUFFIX", " купить в %CITYS% - ООО \"Ферус\"");
+
+// Контактный блок для description SEO-страниц OCFilter — приклеивается
+// кодом (не ИИ) по тем же причинам, что и для title: гарантированная
+// точность плейсхолдеров %CITYS%/%TELEPHONE%/%EMAIL%, и телефон/email
+// кликабельны (tel:/mailto:), как в примере с обычных страниц каталога.
+define("OCFILTER_DESCRIPTION_FOOTER_HTML", <<<'OCFOOTER'
+<p>Купить продукцию в %CITYS% можно оптом и в розницу. Уточнить наличие, стоимость и условия доставки Вы можете, позвонив по телефону или написав на электронную почту в отдел продаж:</p>
+
+<p><strong><a href="tel:%TELEPHONE%">%TELEPHONE%</a></strong></p>
+
+<p><strong><a href="mailto:%EMAIL%">%EMAIL%</a></strong></p>
+
+<p><strong>ООО "Ферус", г. %CITY%</strong></p>
+OCFOOTER
+);
+
+define("SITE_DOCUMENT_ROOT", dirname(OC_CONFIG_PATH)); // для записи файла-подтверждения IndexNow
+
+// ==================== ПРИВЯЗКИ ПРОМПТОВ ====================
+
+function getMappingFile()
+{
+    return PROMPTS_DIR . "/section_mapping.json";
+}
+
+function loadSectionPromptFiles()
+{
+    $file = getMappingFile();
+    if (!file_exists($file)) {
+        return [];
+    }
+    $data = json_decode(file_get_contents($file), true);
+    return is_array($data) ? $data : [];
+}
+
+function saveSectionPromptFiles($mapping)
+{
+    if (!is_dir(PROMPTS_DIR)) {
+        if (!@mkdir(PROMPTS_DIR, 0755, true)) {
+            throw new \RuntimeException("Не удалось создать папку " . PROMPTS_DIR . " (проверь права доступа)");
+        }
+    }
+    $result = @file_put_contents(getMappingFile(), json_encode($mapping, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    if ($result === false) {
+        throw new \RuntimeException("Не удалось записать " . getMappingFile() . " (проверь права доступа на папку prompts/)");
+    }
+}
+
+function getPromptFilePath($sectionId, $sectionPromptFiles)
+{
+    if (isset($sectionPromptFiles[$sectionId])) {
+        $path = PROMPTS_DIR . "/" . $sectionPromptFiles[$sectionId];
+        if (file_exists($path)) {
+            return $path;
+        }
+    }
+    return PROMPTS_DIR . "/default.txt";
+}
+
+// ==================== СБОР ДАННЫХ О ТОВАРЕ ====================
+
+function normalizeProductScope($scope)
+{
+    $allowed = ["all", "google_indexable", "google_impressions"];
+    return in_array($scope, $allowed, true) ? $scope : "all";
+}
+
+function getProductScopeFromArgv($argv)
+{
+    foreach ($argv as $arg) {
+        if (strpos($arg, "--scope=") === 0) {
+            return normalizeProductScope(substr($arg, 8));
+        }
+    }
+    return "all";
+}
+
+function productScopeLabel($scope)
+{
+    $scope = normalizeProductScope($scope);
+    if ($scope === "google_indexable") {
+        return "только открытые для Google";
+    }
+    if ($scope === "google_impressions") {
+        return "открытые для Google + есть показы GSC";
+    }
+    return "все активные товары категории";
+}
+
+function getElementIdsBySection($categoryId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+
+    $sql = "SELECT DISTINCT p.product_id
+            FROM " . TBL_PREFIX . "product_to_category ptc
+            INNER JOIN " . TBL_PREFIX . "product p ON p.product_id = ptc.product_id";
+
+    if ($scope === "google_impressions") {
+        $sql .= " INNER JOIN " . TBL_PREFIX . "seo_index_signal sis
+                  ON sis.product_id = p.product_id";
+    }
+
+    $sql .= " WHERE ptc.category_id = :cat AND p.status = 1";
+
+    if ($scope === "google_indexable" || $scope === "google_impressions") {
+        $sql .= " AND p.google_sitemap_enabled = 1 AND p.googlebot_noindex = 0";
+    }
+
+    if ($scope === "google_impressions") {
+        $sql .= " AND COALESCE(sis.google_impressions, 0) > 0";
+    }
+
+    $sql .= " ORDER BY p.product_id";
+
+    $stmt = db()->prepare($sql);
+    $stmt->execute(["cat" => $categoryId]);
+    $ids = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $ids[] = (int)$row["product_id"];
+    }
+    return $ids;
+}
+
+function getProductContext($productId)
+{
+    // Название товара + текущее описание
+    $sql = "SELECT name, description
+            FROM " . TBL_PREFIX . "product_description
+            WHERE product_id = :id AND language_id = :lang";
+    $stmt = db()->prepare($sql);
+    $stmt->execute(["id" => $productId, "lang" => LANGUAGE_ID]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$row) {
+        return null;
+    }
+
+    // Характеристики через атрибуты
+    $sqlAttr = "SELECT ad.name AS attr_name, pa.text AS attr_value
+                FROM " . TBL_PREFIX . "product_attribute pa
+                INNER JOIN " . TBL_PREFIX . "attribute_description ad
+                    ON ad.attribute_id = pa.attribute_id AND ad.language_id = :lang
+                WHERE pa.product_id = :id AND pa.language_id = :lang";
+    $stmtAttr = db()->prepare($sqlAttr);
+    $stmtAttr->execute(["id" => $productId, "lang" => LANGUAGE_ID]);
+
+    $propList = [];
+    while ($attrRow = $stmtAttr->fetch(PDO::FETCH_ASSOC)) {
+        if (trim($attrRow["attr_value"]) === "") {
+            continue;
+        }
+        $propList[$attrRow["attr_name"]] = $attrRow["attr_value"];
+    }
+
+    // Название первой связанной категории — для контекста (аналог IBLOCK_SECTION_ID)
+    $sqlCat = "SELECT cd.name
+               FROM " . TBL_PREFIX . "product_to_category ptc
+               INNER JOIN " . TBL_PREFIX . "category_description cd
+                   ON cd.category_id = ptc.category_id AND cd.language_id = :lang
+               WHERE ptc.product_id = :id
+               LIMIT 1";
+    $stmtCat = db()->prepare($sqlCat);
+    $stmtCat->execute(["id" => $productId, "lang" => LANGUAGE_ID]);
+    $catRow = $stmtCat->fetch(PDO::FETCH_ASSOC);
+    $sectionName = $catRow ? $catRow["name"] : "";
+
+    return [
+        "id" => $productId,
+        "name" => $row["name"],
+        "section" => $sectionName,
+        "properties" => $propList,
+        "existing_text" => trim(strip_tags($row["description"] ?? "")),
+        "existing_text_html" => $row["description"] ?? "",
+    ];
+}
+
+// ==================== ВНУТРЕННЯЯ ПЕРЕЛИНКОВКА ====================
+
+function normalizeInternalHref($url)
+{
+    $url = html_entity_decode(trim((string)$url), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($url === '') {
+        return '';
+    }
+
+    if (preg_match('~^https?://~i', $url)) {
+        $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+        if ($host !== SITE_HOST && !preg_match('/\\.' . preg_quote(SITE_HOST, '/') . '$/i', $host)) {
+            return '';
+        }
+        $path = (string)parse_url($url, PHP_URL_PATH);
+    } else {
+        $path = $url;
+    }
+
+    $path = '/' . ltrim($path, '/');
+    $path = preg_replace('~/+~', '/', $path);
+    if ($path !== '/') {
+        $path = rtrim($path, '/') . '/';
+    }
+    return $path;
+}
+
+function loadCategorySeoMap()
+{
+    $map = [];
+
+    // Новая схема seo_url: key/value.
+    try {
+        $sql = "SELECT `value` AS category_id, keyword FROM " . TBL_PREFIX . "seo_url
+                WHERE `key` = 'category_id' AND store_id = :store AND language_id = :lang";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["store" => STORE_ID, "lang" => LANGUAGE_ID]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $id = (int)($row['category_id'] ?? 0);
+            $kw = trim((string)($row['keyword'] ?? ''));
+            if ($id > 0 && $kw !== '') {
+                $map[$id] = trim($kw, '/');
+            }
+        }
+    } catch (\Throwable $e) {
+        // Старая схема будет ниже.
+    }
+
+    // Старая схема seo_url: query='category_id=N'.
+    try {
+        $sql = "SELECT query, keyword FROM " . TBL_PREFIX . "seo_url
+                WHERE query LIKE 'category_id=%' AND store_id = :store";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["store" => STORE_ID]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            if (!preg_match('/category_id=(\\d+)/', (string)($row['query'] ?? ''), $m)) {
+                continue;
+            }
+            $id = (int)$m[1];
+            $kw = trim((string)($row['keyword'] ?? ''));
+            if ($id > 0 && $kw !== '') {
+                $map[$id] = trim($kw, '/');
+            }
+        }
+    } catch (\Throwable $e) {
+        // Если обе схемы не подошли, caller получит пустую карту.
+    }
+
+    return $map;
+}
+
+function buildInternalLinksCatalog($writeFile = true)
+{
+    $categorySeo = loadCategorySeoMap();
+    if (empty($categorySeo)) {
+        return ["error" => "Не удалось получить SEO-URL категорий из " . TBL_PREFIX . "seo_url"];
+    }
+
+    $links = [];
+    $seen = [];
+
+    $sql = "SELECT c.category_id, cd.name
+            FROM " . TBL_PREFIX . "category c
+            INNER JOIN " . TBL_PREFIX . "category_description cd
+                ON cd.category_id = c.category_id AND cd.language_id = :lang
+            WHERE c.status = 1";
+    $stmt = db()->prepare($sql);
+    $stmt->execute(["lang" => LANGUAGE_ID]);
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $categoryId = (int)$row['category_id'];
+        if (empty($categorySeo[$categoryId])) {
+            continue;
+        }
+        $href = normalizeInternalHref('/' . $categorySeo[$categoryId] . '/');
+        if ($href === '' || isset($seen[$href])) {
+            continue;
+        }
+        $seen[$href] = true;
+        $links[] = [
+            "type" => "category",
+            "category_id" => $categoryId,
+            "name" => trim((string)$row['name']),
+            "params" => "",
+            "keyword" => $categorySeo[$categoryId],
+            "href" => $href,
+            "url" => SITE_PROTOCOL . "://" . SITE_HOST . $href,
+        ];
+    }
+
+    // SEO-страницы OCFilter. URL строим так же, как реально работает сайт:
+    // /<keyword категории>/<params>/ . Поле page.keyword хранит только
+    // SEO-псевдоним самой страницы и не используется для сборки маршрута.
+    try {
+        $sql = "SELECT p.ocfilter_page_id, p.category_id, p.params, p.keyword,
+                       pd.name AS page_name, cd.name AS category_name
+                FROM " . TBL_PREFIX . "ocfilter_page p
+                LEFT JOIN " . TBL_PREFIX . "ocfilter_page_description pd
+                    ON pd.ocfilter_page_id = p.ocfilter_page_id AND pd.language_id = :lang
+                LEFT JOIN " . TBL_PREFIX . "category_description cd
+                    ON cd.category_id = p.category_id AND cd.language_id = :lang2
+                WHERE p.status = 1";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["lang" => LANGUAGE_ID, "lang2" => LANGUAGE_ID]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $categoryId = (int)$row['category_id'];
+            $params = trim((string)($row['params'] ?? ''), '/');
+            if ($params === '' || empty($categorySeo[$categoryId])) {
+                continue;
+            }
+            $href = normalizeInternalHref('/' . $categorySeo[$categoryId] . '/' . $params . '/');
+            if ($href === '' || isset($seen[$href])) {
+                continue;
+            }
+            $seen[$href] = true;
+            $pageName = trim((string)($row['page_name'] ?? ''));
+            if ($pageName === '') {
+                $pageName = trim((string)($row['category_name'] ?? '')) . ' ' . str_replace('/', ' ', $params);
+            }
+            $links[] = [
+                "type" => "ocfilter",
+                "ocfilter_page_id" => (int)$row['ocfilter_page_id'],
+                "category_id" => $categoryId,
+                "name" => trim($pageName),
+                "category_name" => trim((string)($row['category_name'] ?? '')),
+                "params" => $params,
+                "keyword" => trim((string)($row['keyword'] ?? '')),
+                "href" => $href,
+                "url" => SITE_PROTOCOL . "://" . SITE_HOST . $href,
+            ];
+        }
+    } catch (\Throwable $e) {
+        return ["error" => "Ошибка чтения OCFilter: " . $e->getMessage()];
+    }
+
+    usort($links, function ($a, $b) {
+        $cmp = strcmp($a['type'], $b['type']);
+        if ($cmp !== 0) return $cmp;
+        $cmp = ((int)$a['category_id']) <=> ((int)$b['category_id']);
+        if ($cmp !== 0) return $cmp;
+        return strcmp($a['href'], $b['href']);
+    });
+
+    $payload = [
+        "generated_at" => date('c'),
+        "site" => SITE_PROTOCOL . "://" . SITE_HOST,
+        "count" => count($links),
+        "links" => $links,
+    ];
+
+    if ($writeFile) {
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if (@file_put_contents(INTERNAL_LINKS_CATALOG_FILE, $json) === false) {
+            return ["error" => "Не удалось записать " . INTERNAL_LINKS_CATALOG_FILE];
+        }
+    }
+
+    return $payload;
+}
+
+function ensureInternalLinksCatalog($force = false)
+{
+    $needBuild = $force || !file_exists(INTERNAL_LINKS_CATALOG_FILE);
+    if (!$needBuild && INTERNAL_LINKS_CATALOG_TTL > 0) {
+        $mtime = @filemtime(INTERNAL_LINKS_CATALOG_FILE);
+        $needBuild = (!$mtime || (time() - $mtime) > INTERNAL_LINKS_CATALOG_TTL);
+    }
+
+    if ($needBuild) {
+        return buildInternalLinksCatalog(true);
+    }
+
+    $data = json_decode((string)@file_get_contents(INTERNAL_LINKS_CATALOG_FILE), true);
+    if (!is_array($data) || !isset($data['links']) || !is_array($data['links'])) {
+        return buildInternalLinksCatalog(true);
+    }
+    return $data;
+}
+
+function internalLinkTokens($text)
+{
+    $text = mb_strtolower(str_replace('ё', 'е', (string)$text), 'UTF-8');
+    preg_match_all('/[a-zа-я0-9]+/u', $text, $m);
+    $stop = array_flip([
+        'для','или','это','как','при','по','из','на','в','с','со','к','от','до','и','а','но','не','же','у','о','об',
+        'товар','товары','продукция','каталог','раздел','страница','марка','тип','вид','размер','гост'
+    ]);
+    $out = [];
+    foreach ($m[0] as $token) {
+        if (mb_strlen($token, 'UTF-8') < 2 || isset($stop[$token])) {
+            continue;
+        }
+        $out[$token] = true;
+    }
+    return array_keys($out);
+}
+
+function loadInternalLinksList()
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+    $data = ensureInternalLinksCatalog(false);
+    if (isset($data['error']) || !isset($data['links']) || !is_array($data['links'])) {
+        $cache = [];
+        return $cache;
+    }
+    $cache = $data['links'];
+    return $cache;
+}
+
+function selectInternalLinkCandidates($contextText, $categoryId = null, $excludeHref = '', $limit = INTERNAL_LINKS_MAX_CANDIDATES)
+{
+    $links = loadInternalLinksList();
+    if (empty($links)) {
+        return [];
+    }
+
+    $contextTokens = array_flip(internalLinkTokens($contextText));
+    $excludeHref = normalizeInternalHref($excludeHref);
+    $scored = [];
+
+    foreach ($links as $link) {
+        $href = normalizeInternalHref($link['href'] ?? $link['url'] ?? '');
+        if ($href === '' || ($excludeHref !== '' && $href === $excludeHref)) {
+            continue;
+        }
+
+        $sameCategory = ($categoryId !== null && (int)($link['category_id'] ?? 0) === (int)$categoryId);
+        $tokens = internalLinkTokens(
+            ($link['name'] ?? '') . ' ' . ($link['category_name'] ?? '') . ' ' . ($link['params'] ?? '') . ' ' . ($link['keyword'] ?? '')
+        );
+        $overlap = 0;
+        foreach ($tokens as $token) {
+            if (isset($contextTokens[$token])) {
+                $overlap++;
+            }
+        }
+
+        $type = $link['type'] ?? '';
+        $score = $overlap * 30;
+
+        if ($sameCategory && $type === 'category') {
+            $score += 200; // родительский раздел — самый естественный кандидат
+        } elseif ($sameCategory && $type === 'ocfilter') {
+            if ($overlap === 0) {
+                continue; // не подсовываем случайные фильтры той же категории
+            }
+            $score += 90;
+        } elseif (!$sameCategory) {
+            if ($overlap < 2) {
+                continue; // другие разделы только при явной текстовой связи
+            }
+            $score += ($type === 'category' ? 25 : 10);
+        }
+
+        if ($score <= 0) {
+            continue;
+        }
+
+        $link['href'] = $href;
+        $link['_score'] = $score;
+        $scored[] = $link;
+    }
+
+    usort($scored, function ($a, $b) {
+        if ($a['_score'] === $b['_score']) {
+            if (($a['type'] ?? '') !== ($b['type'] ?? '')) {
+                return ($a['type'] ?? '') === 'category' ? -1 : 1;
+            }
+            return strcmp((string)$a['href'], (string)$b['href']);
+        }
+        return $b['_score'] <=> $a['_score'];
+    });
+
+    $scored = array_slice($scored, 0, max(1, (int)$limit));
+    foreach ($scored as &$item) {
+        unset($item['_score']);
+    }
+    unset($item);
+    return $scored;
+}
+
+function normalizeInternalLinksMax($value)
+{
+    $value = (int)$value;
+    if ($value < 0) $value = 0;
+    if ($value > 10) $value = 10;
+    return $value;
+}
+
+function extractInternalLinksMaxFromTemplate($template)
+{
+    if (preg_match('/\{\{INTERNAL_LINKS\s*:\s*(\d+)\s*\}\}/i', (string)$template, $m)) {
+        return normalizeInternalLinksMax($m[1]);
+    }
+    return INTERNAL_LINKS_DEFAULT_MAX_LINKS;
+}
+
+function extractInternalLinksMaxFromRenderedPrompt($prompt)
+{
+    if (preg_match('/Максимум внутренних ссылок:\s*(\d+)/ui', (string)$prompt, $m)) {
+        return normalizeInternalLinksMax($m[1]);
+    }
+    return INTERNAL_LINKS_DEFAULT_MAX_LINKS;
+}
+
+function buildInternalLinkPromptBlock($candidates, $maxLinks = INTERNAL_LINKS_DEFAULT_MAX_LINKS)
+{
+    $maxLinks = normalizeInternalLinksMax($maxLinks);
+    if ($maxLinks === 0) {
+        return "\n\nВНУТРЕННЯЯ ПЕРЕЛИНКОВКА:\nМаксимум внутренних ссылок: 0\nНе добавляй <a href> в основной текст.\n";
+    }
+
+    if (empty($candidates)) {
+        return "\n\nВНУТРЕННЯЯ ПЕРЕЛИНКОВКА:\nМаксимум внутренних ссылок: {$maxLinks}\nДля этой страницы подходящих разрешённых ссылок не найдено. Не добавляй <a href> в текст.\n";
+    }
+
+    $lines = [];
+    foreach ($candidates as $item) {
+        $kind = ($item['type'] ?? '') === 'ocfilter' ? 'SEO-страница фильтра' : 'раздел каталога';
+        $name = trim((string)($item['name'] ?? ''));
+        $href = normalizeInternalHref($item['href'] ?? '');
+        if ($href === '') continue;
+        $lines[] = "- {$kind}: {$name} | href={$href}";
+    }
+
+    return "\n\nВНУТРЕННЯЯ ПЕРЕЛИНКОВКА (обязательно соблюдай):\n"
+        . "Максимум внутренних ссылок: {$maxLinks}\n"
+        . "Ниже дан закрытый список разрешённых внутренних ссылок. Добавь от 0 до {$maxLinks} ссылок прямо внутри естественных предложений основного текста. Не стремись использовать максимум: если ссылка неуместна, пропусти её.\n"
+        . "Правила:\n"
+        . "- используй ТОЛЬКО href из списка ниже; запрещено придумывать URL;\n"
+        . "- вставляй ссылку HTML-тегом <a href=\"/путь/\">живой естественный анкор</a>;\n"
+        . "- анкор должен описывать сущность и быть частью нормального предложения;\n"
+        . "- ссылки можно размещать в разных абзацах текста;\n"
+        . "- не используй анкоры «здесь», «по ссылке», «подробнее», «перейти»;\n"
+        . "- не ставь две ссылки рядом и не повторяй один и тот же href;\n"
+        . "- href оставляй относительным, как в списке, чтобы ссылка работала на текущем региональном домене.\n"
+        . "Разрешённые кандидаты:\n" . implode("\n", $lines) . "\n";
+}
+
+function injectInternalLinksBlock($template, $block)
+{
+    // Рекомендуемый вариант: явный плейсхолдер {{INTERNAL_LINKS}} или
+    // {{INTERNAL_LINKS:N}}, где N — максимум ссылок. Для старых промптов,
+    // где плейсхолдера ещё нет, блок дописываем в конец для совместимости.
+    $pattern = '/\{\{INTERNAL_LINKS(?:\s*:\s*\d+)?\s*\}\}/i';
+    if (preg_match($pattern, (string)$template)) {
+        return preg_replace($pattern, trim($block), (string)$template, 1);
+    }
+    return rtrim((string)$template) . $block;
+}
+
+function getAllowedInternalHrefSet()
+{
+    $set = [];
+    foreach (loadInternalLinksList() as $item) {
+        $href = normalizeInternalHref($item['href'] ?? $item['url'] ?? '');
+        if ($href !== '') {
+            $set[$href] = true;
+        }
+    }
+    return $set;
+}
+
+function sanitizeGeneratedInternalLinks($html, $maxLinks = INTERNAL_LINKS_DEFAULT_MAX_LINKS)
+{
+    $maxLinks = normalizeInternalLinksMax($maxLinks);
+    $allowed = getAllowedInternalHrefSet();
+    if (empty($allowed)) {
+        // Если каталог почему-то недоступен, безопаснее убрать ссылки модели,
+        // чем пропустить придуманный URL.
+        return preg_replace('~</?a\\b[^>]*>~is', '', (string)$html);
+    }
+
+    $kept = [];
+    $html = preg_replace_callback(
+        '~<a\\b[^>]*\\bhref\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))[^>]*>(.*?)</a>~is',
+        function ($m) use ($allowed, &$kept, $maxLinks) {
+            $rawHref = $m[1] !== '' ? $m[1] : ($m[2] !== '' ? $m[2] : $m[3]);
+            $href = normalizeInternalHref($rawHref);
+            $inner = $m[4];
+            if ($href === '' || !isset($allowed[$href])) {
+                return $inner; // оставляем живой текст анкоров, но снимаем запрещённую ссылку
+            }
+            if ($maxLinks === 0 || count($kept) >= $maxLinks) {
+                return $inner; // превышение лимита: оставляем текст, но снимаем ссылку
+            }
+            $token = '___FERUS_INTERNAL_LINK_' . count($kept) . '___';
+            $kept[$token] = '<a href="' . htmlspecialchars($href, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">' . $inner . '</a>';
+            return $token;
+        },
+        (string)$html
+    );
+
+    // Убираем любые непарные/нестандартные теги <a>, которые не прошли
+    // строгую проверку выше, затем возвращаем проверенные ссылки.
+    $html = preg_replace('~</?a\\b[^>]*>~is', '', $html);
+    if (!empty($kept)) {
+        $html = strtr($html, $kept);
+    }
+    return $html;
+}
+
+function extractInternalLinksFromHtml($html)
+{
+    $found = [];
+    if (preg_match_all('~<a\\b[^>]*\\bhref="([^"]+)"[^>]*>~is', (string)$html, $m)) {
+        foreach ($m[1] as $href) {
+            $href = normalizeInternalHref($href);
+            if ($href !== '') $found[$href] = true;
+        }
+    }
+    return array_keys($found);
+}
+
+// ==================== ПРОМПТ ====================
+
+function renderRewriteBlock($product)
+{
+    if (empty($product["existing_text"])) {
+        return "";
+    }
+    $path = PROMPTS_DIR . "/rewrite_block.txt";
+    if (!file_exists($path)) {
+        return "";
+    }
+    $template = file_get_contents($path);
+    return str_replace("{{EXISTING_TEXT}}", $product["existing_text"], $template) . "\n";
+}
+
+function buildPrompt($product, $sectionId, $extraInstructions, $sectionPromptFiles)
+{
+    $propsText = "";
+    foreach ($product["properties"] as $name => $value) {
+        $propsText .= "- {$name}: {$value}\n";
+    }
+
+    $promptFile = getPromptFilePath($sectionId, $sectionPromptFiles);
+
+    if (!file_exists($promptFile)) {
+        return "ОШИБКА КОНФИГУРАЦИИ: файл промпта не найден: {$promptFile}";
+    }
+
+    $template = file_get_contents($promptFile);
+
+    $extraBlock = "";
+    if (!empty($extraInstructions)) {
+        $extraBlock = "\nОсобенности именно этой категории товара (обязательно учти):\n{$extraInstructions}\n";
+    }
+
+    $rewriteBlock = renderRewriteBlock($product);
+
+    $replacements = [
+        "{{NAME}}" => $product["name"],
+        "{{SECTION}}" => $product["section"],
+        "{{PROPS}}" => $propsText,
+        "{{EXTRA_BLOCK}}" => $extraBlock,
+        "{{REWRITE_BLOCK}}" => $rewriteBlock,
+    ];
+
+    $internalLinksMax = extractInternalLinksMaxFromTemplate($template);
+    $basePrompt = str_replace(array_keys($replacements), array_values($replacements), $template);
+    $linkContext = $product["name"] . " " . $product["section"] . " " . $propsText;
+    $candidates = selectInternalLinkCandidates($linkContext, (int)$sectionId, "", INTERNAL_LINKS_MAX_CANDIDATES);
+    $linkBlock = buildInternalLinkPromptBlock($candidates, $internalLinksMax);
+    return injectInternalLinksBlock($basePrompt, $linkBlock);
+}
+
+// ==================== ВЫЗОВ CLAUDE API (идентично Bitrix-версии) ====================
+
+function callClaudeAPI($prompt)
+{
+    $maxAttempts = 3;
+    $lastError = "";
+
+    for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+        if ($attempt > 1) {
+            fwrite(STDERR, "[retry] Попытка {$attempt}/{$maxAttempts}...\n");
+            sleep(3);
+        }
+
+        $result = callClaudeAPIAttempt($prompt);
+
+        if (!isset($result["error"])) {
+            return $result;
+        }
+
+        $lastError = $result["error"];
+    }
+
+    return ["error" => "После {$maxAttempts} попыток: " . $lastError];
+}
+
+function callClaudeAPIAttempt($prompt)
+{
+    $payload = json_encode([
+        "model" => ROUTER_CHEAP_MODEL,
+        "max_tokens" => 2000,
+        "stream" => true,
+        "messages" => [
+            ["role" => "user", "content" => $prompt],
+        ],
+    ], JSON_UNESCAPED_UNICODE);
+
+    $accumulatedText = "";
+    $sseBuffer = "";
+    $streamError = "";
+
+    $ch = curl_init("https://direct.router-cheap.com/v1/messages");
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_HTTPHEADER => [
+            "Content-Type: application/json",
+            "x-api-key: " . ROUTER_CHEAP_API_KEY,
+            "anthropic-version: 2023-06-01",
+            "Accept: text/event-stream",
+        ],
+        CURLOPT_USERAGENT => "curl/7.88.1",
+        CURLOPT_TIMEOUT => 180,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+        CURLOPT_WRITEFUNCTION => function ($curlHandle, $chunk) use (&$accumulatedText, &$streamError, &$sseBuffer) {
+            $sseBuffer .= $chunk;
+            $lastNewlinePos = strrpos($sseBuffer, "\n");
+            if ($lastNewlinePos === false) {
+                return strlen($chunk);
+            }
+            $completeLines = substr($sseBuffer, 0, $lastNewlinePos);
+            $sseBuffer = substr($sseBuffer, $lastNewlinePos + 1);
+
+            foreach (explode("\n", $completeLines) as $line) {
+                $line = trim($line);
+                if (strpos($line, "data:") !== 0) {
+                    continue;
+                }
+                $jsonStr = trim(substr($line, 5));
+                if ($jsonStr === "" || $jsonStr === "[DONE]") {
+                    continue;
+                }
+                $event = json_decode($jsonStr, true);
+                if (!is_array($event)) {
+                    continue;
+                }
+                if (($event["type"] ?? "") === "content_block_delta"
+                    && ($event["delta"]["type"] ?? "") === "text_delta") {
+                    $accumulatedText .= $event["delta"]["text"];
+                }
+                if (($event["type"] ?? "") === "error") {
+                    $streamError = $event["error"]["message"] ?? "unknown stream error";
+                }
+            }
+            return strlen($chunk);
+        },
+    ]);
+
+    curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        return ["error" => "cURL error: " . $curlError];
+    }
+    if ($streamError) {
+        return ["error" => "API stream error: " . $streamError];
+    }
+    if ($httpCode !== 200) {
+        return ["error" => "API error ({$httpCode}), накоплено символов: " . strlen($accumulatedText)];
+    }
+    if (trim($accumulatedText) === "") {
+        return ["error" => "Пустой ответ от API (стрим завершился без текста)"];
+    }
+
+    return ["text" => cleanGeneratedText($accumulatedText)];
+}
+
+function cleanGeneratedText($text)
+{
+    $text = trim($text);
+    $text = preg_replace('/^```(?:html)?\s*/i', '', $text);
+    $text = preg_replace('/\s*```$/', '', $text);
+    $text = trim($text);
+
+    if ($text !== "" && $text[0] !== "<") {
+        if (preg_match('/<(p|h2|h3|ul)\b/i', $text, $m, PREG_OFFSET_CAPTURE)) {
+            $text = substr($text, $m[0][1]);
+        }
+    }
+
+    if (preg_match('/^<p>[^<]{1,20}(<h[23]\b)/iu', $text, $m2, PREG_OFFSET_CAPTURE)) {
+        $text = substr($text, $m2[1][1]);
+    }
+
+    return trim($text);
+}
+
+// ==================== Google Search Console / Sitemap API ====================
+
+function base64UrlEncode($data)
+{
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function getGoogleAccessToken($serviceAccountJson = GOOGLE_SERVICE_ACCOUNT_JSON)
+{
+    if (!file_exists($serviceAccountJson)) {
+        return ["error" => "Не найден service account JSON: {$serviceAccountJson}"];
+    }
+
+    $credentials = json_decode(file_get_contents($serviceAccountJson), true);
+    if (!is_array($credentials)) {
+        return ["error" => "Не удалось прочитать service account JSON: {$serviceAccountJson}"];
+    }
+
+    $clientEmail = $credentials["client_email"] ?? "";
+    $privateKey = $credentials["private_key"] ?? "";
+    $tokenUri = $credentials["token_uri"] ?? "https://oauth2.googleapis.com/token";
+    if ($clientEmail === "" || $privateKey === "") {
+        return ["error" => "В service account JSON нет client_email/private_key"];
+    }
+
+    $now = time();
+    $header = base64UrlEncode(json_encode(["alg" => "RS256", "typ" => "JWT"]));
+    $claim = base64UrlEncode(json_encode([
+        "iss" => $clientEmail,
+        "scope" => GOOGLE_WEBMASTERS_SCOPE,
+        "aud" => $tokenUri,
+        "iat" => $now,
+        "exp" => $now + 3600,
+    ]));
+    $unsigned = $header . "." . $claim;
+
+    $signature = "";
+    $ok = openssl_sign($unsigned, $signature, $privateKey, OPENSSL_ALGO_SHA256);
+    if (!$ok) {
+        return ["error" => "Не удалось подписать JWT service account (openssl_sign)"];
+    }
+
+    $jwt = $unsigned . "." . base64UrlEncode($signature);
+    $ch = curl_init($tokenUri);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => http_build_query([
+            "grant_type" => "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion" => $jwt,
+        ]),
+        CURLOPT_HTTPHEADER => ["Content-Type: application/x-www-form-urlencoded"],
+        CURLOPT_TIMEOUT => 30,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        return ["error" => "OAuth cURL error: {$curlError}"];
+    }
+
+    $data = json_decode((string)$response, true);
+    if ($httpCode !== 200 || !is_array($data) || empty($data["access_token"])) {
+        $message = is_array($data) ? ($data["error_description"] ?? $data["error"] ?? $response) : $response;
+        return ["error" => "OAuth HTTP {$httpCode}: {$message}"];
+    }
+
+    return ["access_token" => $data["access_token"]];
+}
+
+function loadGooglePropertyUrls()
+{
+    $properties = [];
+    $configFile = __DIR__ . "/google_impressions/seo-index-config.php";
+
+    if (file_exists($configFile)) {
+        try {
+            // Поддерживаем оба распространённых варианта config.php:
+            // 1) return [...];  2) $config = [...];
+            $config = null;
+            $returned = include $configFile;
+            if (is_array($returned)) {
+                $config = $returned;
+            }
+            if (!is_array($config) && isset($GLOBALS["config"]) && is_array($GLOBALS["config"])) {
+                $config = $GLOBALS["config"];
+            }
+            if (is_array($config)) {
+                $raw = $config["google"]["properties"] ?? [];
+                if (is_array($raw)) {
+                    foreach ($raw as $item) {
+                        $url = is_array($item) ? ($item["property"] ?? $item["url"] ?? "") : $item;
+                        $url = trim((string)$url);
+                        if ($url !== "") {
+                            $properties[] = rtrim($url, "/") . "/";
+                        }
+                    }
+                }
+                $main = trim((string)($config["google"]["property"] ?? $config["base_url"] ?? ""));
+                if ($main !== "") {
+                    $properties[] = rtrim($main, "/") . "/";
+                }
+            }
+        } catch (\Throwable $e) {
+            // Ниже сработает fallback на основной сайт.
+        }
+    }
+
+    if (empty($properties)) {
+        $properties[] = SITE_PROTOCOL . "://" . SITE_HOST . "/";
+    }
+
+    $properties = array_values(array_unique($properties));
+    sort($properties, SORT_STRING);
+    return $properties;
+}
+
+function submitSitemapToGoogle($accessToken, $propertyUrl, $sitemapUrl)
+{
+    $endpoint = "https://www.googleapis.com/webmasters/v3/sites/"
+        . rawurlencode($propertyUrl)
+        . "/sitemaps/"
+        . rawurlencode($sitemapUrl);
+
+    $ch = curl_init($endpoint);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => "PUT",
+        CURLOPT_HTTPHEADER => [
+            "Authorization: Bearer " . $accessToken,
+            "Content-Length: 0",
+        ],
+        CURLOPT_TIMEOUT => 30,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        return ["ok" => false, "http_code" => $httpCode, "error" => $curlError, "response" => $response];
+    }
+
+    return [
+        "ok" => ($httpCode >= 200 && $httpCode < 300),
+        "http_code" => $httpCode,
+        "error" => null,
+        "response" => $response,
+    ];
+}
+
+
+function touchAppliedProducts($sectionId, $scope = "all", $writeReportTimestamp = true)
+{
+    if (empty($sectionId)) {
+        return ["error" => "Не указана категория."];
+    }
+
+    $scope = normalizeProductScope($scope);
+    $reportFile = getReportFile($sectionId, $scope);
+    if (!file_exists($reportFile)) {
+        return ["error" => "Файл отчёта не найден: {$reportFile}"];
+    }
+
+    $report = json_decode(file_get_contents($reportFile), true);
+    if (!is_array($report)) {
+        return ["error" => "Отчёт повреждён: {$reportFile}"];
+    }
+
+    $appliedIds = [];
+    foreach ($report as $item) {
+        if (($item["status"] ?? "") === "applied") {
+            $appliedIds[] = (int)$item["id"];
+        }
+    }
+
+    if (empty($appliedIds)) {
+        return [
+            "updated" => 0,
+            "ids" => [],
+            "report_file" => $reportFile,
+            "report" => $report,
+        ];
+    }
+
+    $stmt = db()->prepare(
+        "UPDATE " . TBL_PREFIX . "product SET date_modified = NOW() WHERE product_id = :id"
+    );
+
+    $updated = 0;
+    $errors = [];
+    foreach ($appliedIds as $id) {
+        try {
+            $stmt->execute(["id" => $id]);
+            $updated++;
+        } catch (\Throwable $e) {
+            $errors[$id] = $e->getMessage();
+        }
+    }
+
+    if ($writeReportTimestamp && $updated > 0) {
+        $nowIso = date("c");
+        foreach ($report as $idx => $item) {
+            if (($item["status"] ?? "") === "applied" && !isset($errors[(int)$item["id"]])) {
+                $report[$idx]["date_modified_touched_at"] = $nowIso;
+            }
+        }
+        file_put_contents($reportFile, json_encode($report, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    }
+
+    return [
+        "updated" => $updated,
+        "ids" => $appliedIds,
+        "errors" => $errors,
+        "report_file" => $reportFile,
+        "report" => $report,
+    ];
+}
+
+function runTouchApplied($sectionId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+    echo "Режим: " . productScopeLabel($scope) . "\n";
+
+    $result = touchAppliedProducts($sectionId, $scope, true);
+    if (isset($result["error"])) {
+        echo "ОШИБКА: {$result['error']}\n";
+        exit(1);
+    }
+
+    echo "Товаров со статусом applied: " . count($result["ids"]) . "\n";
+    echo "date_modified обновлён: {$result['updated']}\n";
+
+    if (!empty($result["errors"])) {
+        foreach ($result["errors"] as $id => $error) {
+            echo "ID {$id}: ОШИБКА — {$error}\n";
+        }
+        exit(1);
+    }
+
+    echo "Готово. Описания не перезаписывались.\n";
+}
+
+function runGoogleRefresh($sectionId, $scope = "all")
+{
+    if (empty($sectionId)) {
+        echo "Ошибка: не указана категория.\n";
+        exit(1);
+    }
+
+    $scope = normalizeProductScope($scope);
+    $reportFile = getReportFile($sectionId, $scope);
+    if (!file_exists($reportFile)) {
+        echo "Файл отчёта не найден: {$reportFile}\n";
+        exit(1);
+    }
+
+    $report = json_decode(file_get_contents($reportFile), true);
+    if (!is_array($report)) {
+        echo "Отчёт повреждён: {$reportFile}\n";
+        exit(1);
+    }
+
+    $appliedIds = [];
+    foreach ($report as $item) {
+        if (($item["status"] ?? "") === "applied") {
+            $appliedIds[] = (int)$item["id"];
+        }
+    }
+
+    if (empty($appliedIds)) {
+        echo "В категории {$sectionId} нет товаров со статусом 'applied' для выбранного режима.\n";
+        exit(0);
+    }
+
+    echo "Режим: " . productScopeLabel($scope) . "\n";
+    echo "Применённых товаров в отчёте: " . count($appliedIds) . "\n";
+
+    // Перед повторной отправкой sitemap помечаем все уже применённые карточки как
+    // действительно изменённые. Это важно и для HTTP Last-Modified, и для
+    // <lastmod>, если sitemap_g строится по oc_product.date_modified.
+    $touchResult = touchAppliedProducts($sectionId, $scope, true);
+    if (isset($touchResult["error"])) {
+        echo "ОШИБКА обновления date_modified: {$touchResult['error']}\n";
+        exit(1);
+    }
+    echo "date_modified обновлён у товаров: {$touchResult['updated']}\n";
+    if (!empty($touchResult["errors"])) {
+        foreach ($touchResult["errors"] as $id => $error) {
+            echo "ID {$id}: ОШИБКА date_modified — {$error}\n";
+        }
+        exit(1);
+    }
+
+    echo "Google получает сигнал через повторную отправку sitemap_g.xml; URL по одному не отправляются.\n\n";
+
+    $tokenResult = getGoogleAccessToken();
+    if (isset($tokenResult["error"])) {
+        echo "ОШИБКА авторизации Google: {$tokenResult['error']}\n";
+        exit(1);
+    }
+
+    $accessToken = $tokenResult["access_token"];
+    $properties = loadGooglePropertyUrls();
+    echo "GSC-ресурсов для обновления: " . count($properties) . "\n";
+
+    $okCount = 0;
+    $failCount = 0;
+    foreach ($properties as $propertyUrl) {
+        $parts = parse_url($propertyUrl);
+        $scheme = $parts["scheme"] ?? "https";
+        $host = $parts["host"] ?? "";
+        if ($host === "") {
+            echo "SKIP {$propertyUrl}: не удалось определить host.\n";
+            $failCount++;
+            continue;
+        }
+
+        $sitemapUrl = $scheme . "://" . $host . GOOGLE_MAIN_SITEMAP_PATH;
+        $result = submitSitemapToGoogle($accessToken, $propertyUrl, $sitemapUrl);
+        if ($result["ok"]) {
+            echo "OK   {$propertyUrl} -> {$sitemapUrl} (HTTP {$result['http_code']})\n";
+            $okCount++;
+        } else {
+            $detail = trim((string)($result["error"] ?: $result["response"]));
+            if (strlen($detail) > 300) {
+                $detail = substr($detail, 0, 300) . "...";
+            }
+            echo "FAIL {$propertyUrl} -> HTTP {$result['http_code']} {$detail}\n";
+            $failCount++;
+        }
+    }
+
+    $nowIso = date("c");
+    if ($okCount > 0) {
+        foreach ($report as $idx => $item) {
+            if (($item["status"] ?? "") === "applied") {
+                $report[$idx]["google_sitemap_refreshed_at"] = $nowIso;
+            }
+        }
+        file_put_contents($reportFile, json_encode($report, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    }
+
+    echo "\nГотово: успешно {$okCount}, ошибок {$failCount}.\n";
+    if ($failCount > 0) {
+        exit(1);
+    }
+}
+
+// ==================== IndexNow ====================
+
+function ensureIndexNowKeyFile()
+{
+    $keyFilePath = SITE_DOCUMENT_ROOT . "/" . INDEXNOW_KEY . ".txt";
+    if (!file_exists($keyFilePath)) {
+        file_put_contents($keyFilePath, INDEXNOW_KEY);
+    }
+    return $keyFilePath;
+}
+
+function getProductUrl($productId)
+{
+    // ВАЖНО: схема oc_seo_url различается между версиями/форками.
+    // Пробуем современный формат OC 3.0.3.x+ (key/value/keyword):
+    try {
+        $sql = "SELECT keyword FROM " . TBL_PREFIX . "seo_url
+                WHERE `key` = 'product_id' AND `value` = :id
+                AND store_id = :store AND language_id = :lang LIMIT 1";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["id" => $productId, "store" => STORE_ID, "lang" => LANGUAGE_ID]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row) {
+            return SITE_PROTOCOL . "://" . SITE_HOST . "/" . $row["keyword"];
+        }
+    } catch (\Throwable $e) {
+        // возможно, таких колонок нет — пробуем старый формат ниже
+    }
+
+    // Старый формат OC2.x / некоторых сборок OcStore (query='product_id=X'):
+    try {
+        $sql = "SELECT keyword FROM " . TBL_PREFIX . "seo_url
+                WHERE query = :query AND store_id = :store LIMIT 1";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["query" => "product_id=" . $productId, "store" => STORE_ID]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row) {
+            return SITE_PROTOCOL . "://" . SITE_HOST . "/" . $row["keyword"];
+        }
+    } catch (\Throwable $e) {
+        // не подошло — вернём null
+    }
+
+    return null;
+}
+
+function submitIndexNow($urls)
+{
+    if (empty($urls)) {
+        return ["error" => "Список URL пуст — нечего отправлять."];
+    }
+
+    $batches = array_chunk($urls, 1000);
+    $results = [];
+
+    foreach ($batches as $batch) {
+        $payload = json_encode([
+            "host" => SITE_HOST,
+            "key" => INDEXNOW_KEY,
+            "keyLocation" => SITE_PROTOCOL . "://" . SITE_HOST . "/" . INDEXNOW_KEY . ".txt",
+            "urlList" => $batch,
+        ]);
+
+        $ch = curl_init("https://api.indexnow.org/indexnow");
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => ["Content-Type: application/json; charset=utf-8"],
+            CURLOPT_TIMEOUT => 30,
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        $results[] = [
+            "batch_size" => count($batch),
+            "http_code" => $httpCode,
+            "error" => $error ?: null,
+            "response" => $response,
+        ];
+    }
+
+    return ["results" => $results];
+}
+
+// ==================== РЕЖИМ: REVIEW ====================
+
+function runReview($sectionId, $extraInstructions, $limit = 0, $scope = "all")
+{
+    if (empty(ROUTER_CHEAP_API_KEY)) {
+        echo "Ошибка: не задан ROUTER_CHEAP_API_KEY (переменная окружения).\n";
+        exit(1);
+    }
+    if (empty($sectionId)) {
+        echo "Ошибка: не указана категория. Запусти как: php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT] [--scope=all|google_indexable|google_impressions]\n";
+        exit(1);
+    }
+
+    $scope = normalizeProductScope($scope);
+
+    $linkCatalog = ensureInternalLinksCatalog(false);
+    if (isset($linkCatalog["error"])) {
+        echo "[перелинковка] ПРЕДУПРЕЖДЕНИЕ: {$linkCatalog['error']}\n";
+    } else {
+        echo "[перелинковка] Каталог: " . count($linkCatalog["links"] ?? []) . " URL.\n";
+    }
+
+    $elementIds = getElementIdsBySection($sectionId, $scope);
+
+    if (empty($elementIds)) {
+        echo "В категории {$sectionId} нет активных товаров.\n";
+        exit(0);
+    }
+
+    $totalInSection = count($elementIds);
+
+    if ($limit > 0 && $limit < count($elementIds)) {
+        $elementIds = array_slice($elementIds, 0, $limit);
+    }
+
+    echo "Режим выборки: " . productScopeLabel($scope) . "\n";
+    echo "Товаров по выбранному фильтру: {$totalInSection}\n";
+    echo "Будет обработано в этом запуске: " . count($elementIds) . "\n";
+
+    $usedPromptFile = basename(getPromptFilePath($sectionId, $GLOBALS['SECTION_PROMPT_FILES']));
+    echo "Используется файл промпта: prompts/{$usedPromptFile}\n";
+    if (!empty($extraInstructions)) {
+        echo "(плюс доп. инструкции для категории {$sectionId})\n";
+    }
+    echo "\n";
+
+    $reportFile = getReportFile($sectionId, $scope);
+
+    $report = [];
+    $doneIds = [];
+    if (file_exists($reportFile)) {
+        $existing = json_decode(file_get_contents($reportFile), true);
+        if (is_array($existing)) {
+            foreach ($existing as $item) {
+                if (in_array($item["status"] ?? "", ["approved", "applied"], true)) {
+                    $report[$item["id"]] = $item;
+                    $doneIds[$item["id"]] = true;
+                }
+            }
+            if (!empty($doneIds)) {
+                echo "Найден предыдущий отчёт: " . count($doneIds) . " товаров уже успешно сгенерированы, пропускаю их.\n\n";
+            }
+        }
+    }
+
+    $saveReport = function () use (&$report, $reportFile) {
+        file_put_contents($reportFile, json_encode(array_values($report), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    };
+
+    foreach ($elementIds as $id) {
+        if (isset($doneIds[$id])) {
+            continue;
+        }
+
+        echo "Обрабатываю товар ID {$id}... ";
+
+        try {
+            $product = getProductContext($id);
+        } catch (\Throwable $e) {
+            echo "обрыв БД (" . $e->getMessage() . "), переподключаюсь... ";
+            reconnectDatabase();
+            try {
+                $product = getProductContext($id);
+            } catch (\Throwable $e2) {
+                echo "ОШИБКА БД после переподключения: {$e2->getMessage()}\n";
+                $report[$id] = [
+                    "id" => $id,
+                    "name" => "",
+                    "status" => "error",
+                    "error" => "DB error: " . $e2->getMessage(),
+                ];
+                $saveReport();
+                continue;
+            }
+        }
+
+        if (!$product) {
+            echo "не найден, пропуск.\n";
+            continue;
+        }
+
+        $prompt = buildPrompt($product, $sectionId, $extraInstructions, $GLOBALS['SECTION_PROMPT_FILES']);
+        $internalLinksMax = extractInternalLinksMaxFromRenderedPrompt($prompt);
+        $result = callClaudeAPI($prompt);
+
+        if (isset($result["error"])) {
+            echo "ОШИБКА: {$result['error']}\n";
+            $report[$id] = [
+                "id" => $id,
+                "name" => $product["name"],
+                "status" => "error",
+                "error" => $result["error"],
+            ];
+            $saveReport();
+            continue;
+        }
+
+        $cleanGeneratedText = sanitizeGeneratedInternalLinks($result["text"], $internalLinksMax);
+        $usedInternalLinks = extractInternalLinksFromHtml($cleanGeneratedText);
+        echo "готово (" . mb_strlen($cleanGeneratedText) . " симв., внутренних ссылок: " . count($usedInternalLinks) . ")\n";
+
+        // Приклеиваем фиксированный коммерческий блок кодом (не ИИ) — так
+        // гарантированно сохраняются правильные плейсхолдеры %CITY%/%PHONE%/%EMAIL%,
+        // которые сайт сам заменит на нужные значения при отображении.
+        $finalText = trim($cleanGeneratedText) . "\n\n" . COMMERCIAL_FOOTER_HTML;
+
+        $report[$id] = [
+            "id" => $id,
+            "name" => $product["name"],
+            "status" => "approved",
+            "detail_text" => $finalText,
+            "internal_links" => $usedInternalLinks,
+        ];
+        $saveReport();
+
+        usleep(500000);
+    }
+
+    echo "\nГотово. Отчёт сохранён: " . $reportFile . "\n";
+    echo "Затем запусти: php ai_generate_descriptions_oc.php apply {$sectionId} --scope={$scope}\n";
+}
+
+function getReportFile($sectionId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+    if ($scope === "all") {
+        // Старое имя сохраняем для полной обратной совместимости.
+        return __DIR__ . "/ai_desc_report_section_{$sectionId}.json";
+    }
+    return __DIR__ . "/ai_desc_report_section_{$sectionId}_{$scope}.json";
+}
+
+// ==================== OCFILTER: SEO-СТРАНИЦЫ ФИЛЬТРОВ ====================
+//
+// Модуль OCFilter — отдельная от товаров сущность: "страница фильтра"
+// (например "Арматура сталь 09Г2С") привязана к категории и к набору
+// параметров фильтра (params), и имеет собственный SEO-адрес (keyword).
+//
+// ВАЖНО: этот блок написан по схеме таблиц, снятой через phpMyAdmin
+// (oc_ocfilter_page / oc_ocfilter_page_description / oc_ocfilter_option /
+// oc_ocfilter_option_value), но НЕ протестирован на реальной базе — перед
+// массовым использованием обязательно проверь работу на 1-2 страницах
+// вручную (создать через genocfilter+applyocfilter, открыть страницу на
+// сайте, сверить с тем, что видно в админке Каталог → OCFilter → Страницы).
+//
+// Формат входного файла (одна страница на строку, поля через ';'):
+//   KEYWORD;CATEGORY;PARAMS
+//   KEYWORD  — желаемый SEO-адрес страницы, напр. armatura-stal-09g2s
+//   CATEGORY — ID категории (число) ИЛИ её keyword/слаг в URL
+//   PARAMS   — путь параметров фильтра, напр. marka/09g2s
+//              (для нескольких фильтров через /: marka/m1/tip/shmm)
+//   Пустые строки и строки, начинающиеся с #, пропускаются.
+
+function getOcFilterInputFile($batchId)
+{
+    return __DIR__ . "/ocfilter_urls_batch_{$batchId}.txt";
+}
+
+function getOcFilterReportFile($batchId)
+{
+    return __DIR__ . "/ai_ocfilter_report_batch_{$batchId}.json";
+}
+
+function getOcFilterPromptFilePath($batchId, $sectionPromptFiles)
+{
+    $key = "ocfilter_" . $batchId;
+    if (isset($sectionPromptFiles[$key])) {
+        $path = OCFILTER_PROMPTS_DIR . "/" . $sectionPromptFiles[$key];
+        if (file_exists($path)) {
+            return $path;
+        }
+    }
+    return OCFILTER_PROMPTS_DIR . "/default.txt";
+}
+
+function ensureOcFilterDefaultPrompt()
+{
+    if (!is_dir(OCFILTER_PROMPTS_DIR)) {
+        @mkdir(OCFILTER_PROMPTS_DIR, 0755, true);
+    }
+    $default = OCFILTER_PROMPTS_DIR . "/default.txt";
+    if (!file_exists($default)) {
+        $starter = "Ты — SEO-копирайтер металлоторговой компании.\n\n"
+            . "Напиши уникальный SEO-текст для страницы фильтра каталога интернет-магазина.\n\n"
+            . "Категория: {{CATEGORY_NAME}}\n"
+            . "Параметры фильтра (технические, необязательно понятные без контекста): {{PARAMS}}\n"
+            . "Желаемый общий смысл страницы (заголовок H1 подбери сам, по-русски, коротко и по-товарному): {{KEYWORD}}\n\n"
+            . "Требования к тексту:\n"
+            . "1. Объём 150-300 слов, HTML-теги <p>/<h2> (без markdown, без <h1> — заголовок H1 сайт возьмёт из отдельного поля).\n"
+            . "2. Не выдумывай характеристики и ГОСТы, которых нет в параметрах фильтра или в названии категории.\n"
+            . "3. Не пиши контактный блок/призыв к действию в конце — сайт добавит его сам кодом.\n"
+            . "4. Без рекламных клише, пиши по-деловому.\n";
+        @file_put_contents($default, $starter);
+    }
+}
+
+// Фиксированный блок-приписка, добавляется кодом к ЛЮБОМУ промпту OCFilter
+// (в т.ч. к кастомным, привязанным через редактор) — просит модель после
+// основного текста страницы вернуть ещё TITLE/H1/META_DESCRIPTION, чтобы
+// name/title/meta_title/meta_description на сайте не собирались программно
+// из сырых "Категория - параметр" (что даёт неуникальные шаблонные заголовки),
+// а были действительно написаны ИИ и отличались от других страниц категории.
+function ocFilterMetaInstructionBlock($categoryName, $params)
+{
+    return "\n\n---\n"
+        . "После основного текста страницы ОБЯЗАТЕЛЬНО выведи ещё три блока, каждый на отдельной строке, СТРОГО в этом формате (без кавычек, без markdown):\n\n"
+        . "[TITLE]заголовок для <title> страницы, до 55 символов[/TITLE]\n"
+        . "[H1]заголовок H1 страницы, до 60 символов[/H1]\n"
+        . "[META_DESCRIPTION]SEO-описание для meta description, 200-300 символов[/META_DESCRIPTION]\n\n"
+        . "Требования к TITLE/H1/META_DESCRIPTION:\n"
+        . "- Каждый из трёх текстов уникален и НЕ повторяет дословно (и почти дословно) формулировки, которые естественно возникли бы для других страниц категории «{$categoryName}» с другим значением параметра фильтра.\n"
+        . "- Обязательно включает название категории «{$categoryName}» (в подходящей словоформе) и конкретное значение параметра фильтра ({$params}).\n"
+        . "- TITLE - это ТОЛЬКО категория с характеристикой (например «Лист стальной гладкий марки 09Г2С»), БЕЗ названия компании и БЕЗ коммерческих фраз («купить», «в наличии» и т.п.) - коммерческую часть и название компании к TITLE добавит код автоматически после твоего ответа, дублировать их не нужно.\n"
+        . "- H1 не обязан быть одинаковым с TITLE - допустима разная формулировка одного смысла. H1 - БЕЗ упоминания города (« в Москве», « в %CITYS%» и т.п.) - код добавит город к H1 сам после твоего ответа. H1 - ТОЛЬКО название категории/товара + характеристика (например «Лист стальной гладкий марки Р6М5»), БЕЗ дефисов/тире внутри H1 и БЕЗ слов «каталог», «страница», «раздел» - никаких служебных приписок, город (код добавит сам) и так уже сделает заголовок полным.\n"
+        . "- Используй обычный дефис «-», НИКОГДА длинное тире «—» или среднее «–».\n"
+        . "- Не придумывай характеристики, свойства марки, применение, ГОСТы - те же ограничения, что и для основного текста. Пиши так, будто не знаешь, что означает обозначение марки - только называй её, без ярлыков вроде «конструкционная», «инструментальная», «нержавеющая», «легированная», без глаголов «применяется», «используется», «отличается», «предназначена» рядом с названием марки.\n"
+        . "- В H1 и META_DESCRIPTION ЗАПРЕЩЕНЫ слова и фразы про наличие/сроки/цену/призыв к действию: «в наличии», «на складе», «купить», «заказать», «доставка», «цена», «недорого», «скидка».\n"
+        . "- META_DESCRIPTION - самостоятельный содержательный текст (не обрезок основного текста), 2-3 законченных предложения. Можешь естественно упомянуть город и/или контакты через плейсхолдеры %CITY% (именительный падеж), %CITYS% (предложный падеж), %TELEPHONE%, %EMAIL% - но ТОЛЬКО этими четырьмя словами В ТОЧНОСТИ, с символами % с обеих сторон, без изменений и без своих плейсхолдеров. %CITYS% УЖЕ в предложном падеже (после подстановки получится, например, «Москве») - перед ним ВСЕГДА ставь предлог «в» вплотную: пиши «в %CITYS%», никогда не пиши голое «%CITYS%» без «в» перед ним (иначе получится грамматическая ошибка вида «...по телефону Москве...»). Использовать плейсхолдеры не обязательно - только если естественно вписывается.\n";
+}
+
+function buildOcFilterPrompt($categoryName, $params, $keyword, $batchId, $sectionPromptFiles, $categoryId = null)
+{
+    ensureOcFilterDefaultPrompt();
+    $promptFile = getOcFilterPromptFilePath($batchId, $sectionPromptFiles);
+    if (!file_exists($promptFile)) {
+        return "ОШИБКА КОНФИГУРАЦИИ: файл промпта не найден: {$promptFile}";
+    }
+    $template = file_get_contents($promptFile);
+    $template .= ocFilterMetaInstructionBlock($categoryName, $params);
+    $replacements = [
+        "{{CATEGORY_NAME}}" => $categoryName,
+        "{{PARAMS}}" => $params,
+        "{{KEYWORD}}" => $keyword,
+    ];
+    $basePrompt = str_replace(array_keys($replacements), array_values($replacements), $template);
+
+    $excludeHref = "";
+    if ($categoryId !== null) {
+        foreach (loadInternalLinksList() as $link) {
+            if (($link["type"] ?? "") === "ocfilter"
+                && (int)($link["category_id"] ?? 0) === (int)$categoryId
+                && trim((string)($link["params"] ?? ""), "/") === trim((string)$params, "/")) {
+                $excludeHref = $link["href"] ?? "";
+                break;
+            }
+        }
+    }
+
+    $internalLinksMax = extractInternalLinksMaxFromTemplate($template);
+    $linkContext = $categoryName . " " . $params . " " . $keyword;
+    $candidates = selectInternalLinkCandidates($linkContext, $categoryId, $excludeHref, INTERNAL_LINKS_MAX_CANDIDATES);
+    $linkBlock = buildInternalLinkPromptBlock($candidates, $internalLinksMax);
+    return injectInternalLinksBlock($basePrompt, $linkBlock);
+}
+
+// Короткий повторный запрос — только TITLE/H1/META_DESCRIPTION, без основного
+// текста страницы. Используется, если с первого раза модель не вернула
+// валидные блоки (перед откатом на программный шаблон).
+function buildOcFilterMetaRetryPrompt($categoryName, $params)
+{
+    return "Категория страницы фильтра каталога металлопроката: «{$categoryName}».\n"
+        . "Параметр страницы: {$params}.\n\n"
+        . "Выведи ТОЛЬКО три блока (без основного текста, без пояснений):\n\n"
+        . "[TITLE]заголовок для <title> страницы, до 55 символов - ТОЛЬКО категория с характеристикой, БЕЗ названия компании и коммерческих фраз (их добавит код)[/TITLE]\n"
+        . "[H1]заголовок H1 страницы, до 60 символов, БЕЗ упоминания города (код добавит его сам), ТОЛЬКО название+характеристика, БЕЗ дефисов внутри и БЕЗ слов «каталог»/«страница»/«раздел»[/H1]\n"
+        . "[META_DESCRIPTION]SEO-описание для meta description, 200-300 символов, 2-3 предложения[/META_DESCRIPTION]\n\n"
+        . "Требования:\n"
+        . "- Включи название категории и значение параметра.\n"
+        . "- Обычный дефис «-» в TITLE/META_DESCRIPTION можно, но НЕ используй «—»/«–» нигде и НЕ используй дефис вообще в H1.\n"
+        . "- Пиши так, будто не знаешь, что означает обозначение марки - только называй её, без ярлыков («конструкционная», «инструментальная», «нержавеющая» и т.п.) и без глаголов «применяется/используется/отличается» рядом с маркой.\n"
+        . "- В H1 и META_DESCRIPTION запрещены «в наличии», «на складе», «купить», «заказать», «доставка», «цена», «недорого», «скидка».\n"
+        . "- В META_DESCRIPTION можно упомянуть %CITY%/%CITYS%/%TELEPHONE%/%EMAIL% - только этими словами В ТОЧНОСТИ, если естественно вписывается. %CITYS% - это город уже в предложном падеже (после подстановки получится, например, «Москве»), поэтому ПЕРЕД %CITYS% ВСЕГДА ставь предлог «в» вплотную: «в %CITYS%» (например «консультации в %CITYS% по телефону...», а НЕ «консультации %CITYS% по телефону...» - без «в» перед %CITYS% получится грамматическая ошибка).\n";
+}
+
+// Извлекает TITLE/H1/META_DESCRIPTION из ответа модели и возвращает
+// [поля_или_null, текст_без_этих_блоков]. null означает "невалидно" -
+// вызывающий код должен либо сделать повторный запрос, либо откатиться
+// на программный шаблон.
+function extractOcFilterMetaFields($text)
+{
+    $fields = [];
+    $clean = $text;
+    $patterns = [
+        "title" => '/\[TITLE\](.*?)\[\/TITLE\]/su',
+        "h1" => '/\[H1\](.*?)\[\/H1\]/su',
+        "meta_description" => '/\[META_DESCRIPTION\](.*?)\[\/META_DESCRIPTION\]/su',
+    ];
+    foreach ($patterns as $key => $pattern) {
+        if (!preg_match($pattern, $text, $m)) {
+            return [null, $text];
+        }
+        $value = trim(strip_tags($m[1]));
+        $value = str_replace(["—", "–", "―"], "-", $value);
+        if ($value === "") {
+            return [null, $text];
+        }
+        $fields[$key] = $value;
+        $clean = preg_replace($pattern, "", $clean);
+    }
+
+    if (mb_strlen($fields["title"]) > 250 || mb_strlen($fields["h1"]) > 250) {
+        return [null, $text];
+    }
+    if (mb_strlen($fields["meta_description"]) > 500) {
+        return [null, $text];
+    }
+
+    // Плейсхолдеры %CITY%/%CITYS%/%TELEPHONE%/%EMAIL% модель может вписать в
+    // META_DESCRIPTION — но только этими четырьмя словами В ТОЧНОСТИ. Если
+    // модель написала что-то похожее, но кривое (%ГОРОД%, %City%,
+    // %CITYS %, и т.п.) - оно улетит на сайт нераскрытым текстом, поэтому
+    // считаем такой ответ невалидным (уйдёт в ретрай/откат на шаблон).
+    $allowedMacros = ["%CITY%", "%CITYS%", "%TELEPHONE%", "%EMAIL%"];
+    if (preg_match_all('/%[A-Za-zА-Яа-яЁё_]+%/u', $fields["meta_description"], $macroMatches)) {
+        foreach ($macroMatches[0] as $macro) {
+            if (!in_array($macro, $allowedMacros, true)) {
+                return [null, $text];
+            }
+        }
+    }
+
+    $clean = preg_replace('/\n{3,}/', "\n\n", trim($clean));
+    return [$fields, $clean];
+}
+
+// Аккуратно обрезает текст под мета-описание: сначала пробует уложиться в
+// лимит целыми предложениями (по точке), иначе обрезает по последнему
+// пробелу перед лимитом — чтобы не рвать слово посередине, как делал
+// голый mb_substr($text, 0, 250).
+function ocFilterBuildMetaDescription($html, $limit = 250)
+{
+    $text = trim(strip_tags($html));
+    if (mb_strlen($text) <= $limit) {
+        return $text;
+    }
+
+    // Пробуем взять целые предложения, пока укладываемся в лимит.
+    preg_match_all('/[^.!?]+[.!?]+/u', $text, $matches);
+    if (!empty($matches[0])) {
+        $result = "";
+        foreach ($matches[0] as $sentence) {
+            $candidate = $result . $sentence;
+            if (mb_strlen(trim($candidate)) > $limit) {
+                break;
+            }
+            $result = $candidate;
+        }
+        $result = trim($result);
+        if ($result !== "") {
+            return $result;
+        }
+    }
+
+    // Ни одно предложение целиком не влезло — обрезаем по последнему пробелу.
+    $cut = mb_substr($text, 0, $limit);
+    $lastSpace = mb_strrpos($cut, " ");
+    if ($lastSpace !== false) {
+        $cut = mb_substr($cut, 0, $lastSpace);
+    }
+    return rtrim($cut, " ,;:-") . "...";
+}
+
+// Разбор одной строки входного файла. Поддерживает два формата:
+//   1) Готовый URL страницы:  https://fe-rus.ru/list-stalnoj-gladkij/marka/r6m5/
+//      Тогда KEYWORD/CATEGORY/PARAMS выводятся автоматически из пути:
+//        - CATEGORY = первый сегмент пути (слаг категории)
+//        - PARAMS   = остаток пути (тип/значение фильтра)
+//        - KEYWORD  = весь путь целиком (это и есть итоговый адрес страницы)
+//   2) Явный формат:  KEYWORD;CATEGORY;PARAMS
+function parseOcFilterInputLine($line)
+{
+    $line = trim($line);
+    if ($line === "" || $line[0] === "#") {
+        return null;
+    }
+
+    // Формат 1: вставлена прямая ссылка на страницу.
+    if (preg_match('~^https?://~i', $line)) {
+        $path = parse_url($line, PHP_URL_PATH);
+        $path = trim((string)$path, "/");
+        if ($path === "") {
+            return null;
+        }
+        $segments = explode("/", $path);
+        if (count($segments) < 2) {
+            // нет хотя бы "категория/параметр" — недостаточно данных
+            return null;
+        }
+        $categorySlug = $segments[0];
+        $params = implode("/", array_slice($segments, 1));
+        // ВАЖНО (уточнено по реальной админке OCFilter, поле "SEO псевдоним"):
+        // keyword - это ТОЛЬКО значение фильтра, последний сегмент URL
+        // (например "s355-5"), БЕЗ типа фильтра и БЕЗ слага категории. Сегмент
+        // типа фильтра ("marka/") сайт достраивает сам из поля "Параметры
+        // фильтра" (params), а слаг категории - из самой категории. Если
+        // положить в keyword params целиком ("marka/s355-5") или весь путь -
+        // получится задвоение на сайте.
+        $keyword = end($segments);
+        return [
+            "keyword" => $keyword,
+            "category_input" => $categorySlug,
+            "params" => $params,
+        ];
+    }
+
+    // Формат 2: явное перечисление через точку с запятой.
+    $parts = array_map("trim", explode(";", $line));
+    if (count($parts) < 3) {
+        return null;
+    }
+    return [
+        "keyword" => $parts[0],
+        "category_input" => $parts[1],
+        "params" => $parts[2],
+    ];
+}
+
+// Находит category_id по числовому ID или по keyword в oc_seo_url; заодно
+// отдаёт человекочитаемое название категории (для промпта и для полей
+// meta/H1 SEO-страницы).
+function resolveOcFilterCategory($categoryInput)
+{
+    $categoryInput = trim((string)$categoryInput);
+    $categoryId = null;
+
+    if (ctype_digit($categoryInput)) {
+        $categoryId = (int)$categoryInput;
+    } else {
+        try {
+            $sql = "SELECT `value` FROM " . TBL_PREFIX . "seo_url
+                    WHERE `key` = 'category_id' AND keyword = :kw
+                    AND store_id = :store AND language_id = :lang LIMIT 1";
+            $stmt = db()->prepare($sql);
+            $stmt->execute(["kw" => $categoryInput, "store" => STORE_ID, "lang" => LANGUAGE_ID]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row) {
+                $categoryId = (int)$row["value"];
+            }
+        } catch (\Throwable $e) {
+            // возможно, старая схема seo_url — пробуем ниже через query=
+        }
+        if ($categoryId === null) {
+            try {
+                $sql = "SELECT query FROM " . TBL_PREFIX . "seo_url
+                        WHERE keyword = :kw AND store_id = :store LIMIT 1";
+                $stmt = db()->prepare($sql);
+                $stmt->execute(["kw" => $categoryInput, "store" => STORE_ID]);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($row && preg_match('/category_id=(\d+)/', $row["query"], $m)) {
+                    $categoryId = (int)$m[1];
+                }
+            } catch (\Throwable $e) {
+                // не подошло
+            }
+        }
+    }
+
+    if ($categoryId === null) {
+        return null;
+    }
+
+    $sql = "SELECT name FROM " . TBL_PREFIX . "category_description
+            WHERE category_id = :id AND language_id = :lang LIMIT 1";
+    $stmt = db()->prepare($sql);
+    $stmt->execute(["id" => $categoryId, "lang" => LANGUAGE_ID]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $categoryName = $row ? $row["name"] : "Категория {$categoryId}";
+
+    return ["category_id" => $categoryId, "category_name" => $categoryName];
+}
+
+function runGenOcFilter($batchId, $limit = 0)
+{
+    if (empty(ROUTER_CHEAP_API_KEY)) {
+        echo "Ошибка: не задан ROUTER_CHEAP_API_KEY (переменная окружения).\n";
+        exit(1);
+    }
+
+    $linkCatalog = ensureInternalLinksCatalog(false);
+    if (isset($linkCatalog["error"])) {
+        echo "[перелинковка] ПРЕДУПРЕЖДЕНИЕ: {$linkCatalog['error']}\n";
+    } else {
+        echo "[перелинковка] Каталог: " . count($linkCatalog["links"] ?? []) . " URL.\n";
+    }
+
+    $inputFile = getOcFilterInputFile($batchId);
+    if (!file_exists($inputFile)) {
+        echo "Не найден файл со списком страниц: {$inputFile}\n";
+        echo "GUI должен загрузить его на сервер перед запуском genocfilter.\n";
+        exit(1);
+    }
+
+    $lines = file($inputFile, FILE_IGNORE_NEW_LINES);
+    $items = [];
+    foreach ($lines as $line) {
+        $parsed = parseOcFilterInputLine($line);
+        if ($parsed) {
+            $items[] = $parsed;
+        }
+    }
+
+    if (empty($items)) {
+        echo "Файл {$inputFile} не содержит ни одной корректной строки (формат: KEYWORD;CATEGORY;PARAMS).\n";
+        exit(0);
+    }
+
+    $totalInBatch = count($items);
+    if ($limit > 0 && $limit < count($items)) {
+        $items = array_slice($items, 0, $limit);
+    }
+
+    echo "Всего страниц в списке: {$totalInBatch}\n";
+    echo "Будет обработано в этом запуске: " . count($items) . "\n\n";
+
+    $reportFile = getOcFilterReportFile($batchId);
+    $report = [];
+    $doneKeywords = [];
+    if (file_exists($reportFile)) {
+        $existing = json_decode(file_get_contents($reportFile), true);
+        if (is_array($existing)) {
+            foreach ($existing as $item) {
+                if (in_array($item["status"] ?? "", ["generated", "applied"], true)) {
+                    $report[$item["keyword"]] = $item;
+                    $doneKeywords[$item["keyword"]] = true;
+                }
+            }
+            if (!empty($doneKeywords)) {
+                echo "Найден предыдущий отчёт: " . count($doneKeywords) . " страниц уже сгенерированы, пропускаю их.\n\n";
+            }
+        }
+    }
+
+    $saveReport = function () use (&$report, $reportFile) {
+        file_put_contents($reportFile, json_encode(array_values($report), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    };
+
+    global $SECTION_PROMPT_FILES;
+
+    foreach ($items as $item) {
+        $keyword = $item["keyword"];
+        if (isset($doneKeywords[$keyword])) {
+            continue;
+        }
+
+        echo "Обрабатываю страницу '{$keyword}'... ";
+
+        $category = resolveOcFilterCategory($item["category_input"]);
+        if (!$category) {
+            echo "не удалось определить категорию '{$item['category_input']}', пропуск.\n";
+            $report[$keyword] = [
+                "keyword" => $keyword,
+                "category_input" => $item["category_input"],
+                "params" => $item["params"],
+                "status" => "error",
+                "error" => "Категория не найдена",
+            ];
+            $saveReport();
+            continue;
+        }
+
+        $prompt = buildOcFilterPrompt($category["category_name"], $item["params"], $keyword, $batchId, $SECTION_PROMPT_FILES, $category["category_id"]);
+        $internalLinksMax = extractInternalLinksMaxFromRenderedPrompt($prompt);
+        $result = callClaudeAPI($prompt);
+
+        if (isset($result["error"])) {
+            echo "ОШИБКА: {$result['error']}\n";
+            $report[$keyword] = [
+                "keyword" => $keyword,
+                "category_id" => $category["category_id"],
+                "category_name" => $category["category_name"],
+                "params" => $item["params"],
+                "status" => "error",
+                "error" => $result["error"],
+            ];
+            $saveReport();
+            continue;
+        }
+
+        echo "готово (" . mb_strlen($result["text"]) . " симв.)\n";
+
+        // Пытаемся вытащить уникальные TITLE/H1/META_DESCRIPTION, которые
+        // модель должна была дописать в конец ответа (см.
+        // ocFilterMetaInstructionBlock). Если не получилось - одна короткая
+        // повторная попытка, и только потом откат на программный шаблон
+        // "Категория - параметр" (гарантированно уникальный по параметру,
+        // но не такой качественный с точки зрения SEO-формулировки).
+        list($metaFields, $bodyText) = extractOcFilterMetaFields($result["text"]);
+        $metaSource = "ai";
+
+        if ($metaFields === null) {
+            echo "  [meta] модель не вернула валидные TITLE/H1/META_DESCRIPTION с первого раза - пробую коротким повторным запросом...\n";
+            $retryPrompt = buildOcFilterMetaRetryPrompt($category["category_name"], $item["params"]);
+            $retryResult = callClaudeAPI($retryPrompt);
+            if (!isset($retryResult["error"])) {
+                list($retryFields, ) = extractOcFilterMetaFields($retryResult["text"]);
+                if ($retryFields !== null) {
+                    $metaFields = $retryFields;
+                    $metaSource = "ai_retry";
+                    echo "  [meta] повторный запрос успешен.\n";
+                } else {
+                    echo "  [meta] повторный запрос тоже не дал валидных полей.\n";
+                }
+            } else {
+                echo "  [meta] ошибка повторного запроса: {$retryResult['error']}\n";
+            }
+        }
+
+        // Дефис вместо длинного тире - см. правило "без длинных тире в метатегах".
+        $fallbackName = trim($category["category_name"] . " - " . str_replace("/", " ", $item["params"]));
+
+        if ($metaFields !== null) {
+            $pageTitle = $metaFields["title"];
+            $pageH1 = $metaFields["h1"];
+            $pageMetaDescription = $metaFields["meta_description"];
+        } else {
+            echo "  [meta] использую программный шаблон вместо уникальных TITLE/H1/META_DESCRIPTION.\n";
+            $metaSource = "fallback";
+            $pageTitle = $fallbackName;
+            $pageH1 = $fallbackName;
+            $pageMetaDescription = ocFilterBuildMetaDescription($bodyText, 300);
+        }
+
+        // ВАЖНО: поле "title" в этой БД подписано в админке как
+        // "Название (H1)" - т.е. именно title рендерится как <h1> на сайте.
+        // Поле "name" (и "button") - это отдельное "название SEO-страницы",
+        // которое показывается в списках админки (и как текст ссылки/пункта
+        // меню фильтра на сайте) - в него НИЧЕГО, кроме названия страницы
+        // с характеристикой (значением параметра), добавлять нельзя: ни
+        // города, ни каких-либо хвостов.
+        $pageNameClean = rtrim($pageH1, " .");
+
+        // %CITYS% (город в предложном падеже) добавляем в H1 кодом (не ИИ) -
+        // гарантированно правильный плейсхолдер на каждой странице.
+        // Это только для title (реального <h1> на сайте), НЕ для name/button.
+        $pageH1 = $pageNameClean . " в %CITYS%";
+
+        // Коммерческий хвост "купить в %CITYS% - ООО "Ферус"" — ТОЛЬКО для
+        // meta_title (реальный <title>/сниппет в поиске), кодом (не ИИ), чтобы
+        // плейсхолдеры и название компании были гарантированно правильными.
+        $pageMetaTitle = rtrim($pageTitle, " .") . OCFILTER_TITLE_SUFFIX;
+
+        // Проверяем перелинковку после отделения META-блоков. Любой href,
+        // которого нет в каталоге, снимается, но сам текст анкоров сохраняется.
+        $bodyText = sanitizeGeneratedInternalLinks($bodyText, $internalLinksMax);
+        $usedInternalLinks = extractInternalLinksFromHtml($bodyText);
+
+        // Контактный блок с %CITYS%/%TELEPHONE%/%EMAIL% — тоже кодом, тоже
+        // после того, как meta_description уже посчитан из чистого $bodyText
+        // (иначе в meta_description мог попасть обрезок контактного блока).
+        $finalBodyText = trim($bodyText) . "\n\n" . OCFILTER_DESCRIPTION_FOOTER_HTML;
+
+        $report[$keyword] = [
+            "keyword" => $keyword,
+            "category_id" => $category["category_id"],
+            "category_name" => $category["category_name"],
+            "params" => $item["params"],
+            "status" => "generated",
+            "name" => $pageNameClean,
+            "title" => $pageH1,
+            "meta_title" => $pageMetaTitle,
+            "meta_keyword" => "",
+            "meta_description" => $pageMetaDescription,
+            "description" => $finalBodyText,
+            "button" => $pageNameClean,
+            "meta_phrase_source" => $metaSource,
+            "internal_links" => $usedInternalLinks,
+        ];
+        $saveReport();
+
+        usleep(500000);
+    }
+
+    echo "\nГотово. Отчёт сохранён: " . $reportFile . "\n";
+    echo "Затем запусти: php ai_generate_descriptions_oc.php applyocfilter {$batchId}\n";
+}
+
+function runApplyOcFilter($batchId)
+{
+    $reportFile = getOcFilterReportFile($batchId);
+    if (!file_exists($reportFile)) {
+        echo "Файл отчёта не найден: {$reportFile}. Сначала запусти genocfilter.\n";
+        exit(1);
+    }
+
+    $report = json_decode(file_get_contents($reportFile), true);
+    if (!is_array($report)) {
+        echo "Отчёт повреждён: {$reportFile}\n";
+        exit(1);
+    }
+
+    $changed = false;
+
+    foreach ($report as $idx => $item) {
+        if (($item["status"] ?? "") !== "generated") {
+            continue;
+        }
+
+        $keyword = $item["keyword"];
+        echo "Применяю страницу '{$keyword}' (категория {$item['category_id']})... ";
+
+        try {
+            db()->beginTransaction();
+
+            // Ищем существующую страницу с таким keyword в этой категории —
+            // если есть, обновляем, а не плодим дубли.
+            $sql = "SELECT ocfilter_page_id FROM " . TBL_PREFIX . "ocfilter_page
+                    WHERE keyword = :kw AND category_id = :cat LIMIT 1";
+            $stmt = db()->prepare($sql);
+            $stmt->execute(["kw" => $keyword, "cat" => $item["category_id"]]);
+            $existing = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($existing) {
+                $pageId = (int)$existing["ocfilter_page_id"];
+                $sql = "UPDATE " . TBL_PREFIX . "ocfilter_page
+                        SET params = :params, date_modified = NOW()
+                        WHERE ocfilter_page_id = :id";
+                $stmt = db()->prepare($sql);
+                $stmt->execute(["params" => $item["params"], "id" => $pageId]);
+            } else {
+                // `over` — зарезервированное слово в MySQL, экранируем бэктиками.
+                $sql = "INSERT INTO " . TBL_PREFIX . "ocfilter_page
+                        (category_id, keyword, params, `over`, sort_order, menu_status, status, statusview, top, date_modified)
+                        VALUES (:cat, :kw, :params, 'category', 0, 0, 1, 1, 0, NOW())";
+                $stmt = db()->prepare($sql);
+                $stmt->execute([
+                    "cat" => $item["category_id"],
+                    "kw" => $keyword,
+                    "params" => $item["params"],
+                ]);
+                $pageId = (int)db()->lastInsertId();
+            }
+
+            $sql = "SELECT ocfilter_page_id FROM " . TBL_PREFIX . "ocfilter_page_description
+                    WHERE ocfilter_page_id = :id AND language_id = :lang";
+            $stmt = db()->prepare($sql);
+            $stmt->execute(["id" => $pageId, "lang" => LANGUAGE_ID]);
+            $descExists = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            $descFields = [
+                "meta_title" => $item["meta_title"],
+                "meta_keyword" => $item["meta_keyword"],
+                "meta_description" => $item["meta_description"],
+                "description" => $item["description"],
+                "title" => $item["title"],
+                "name" => $item["name"],
+                "button" => $item["button"],
+            ];
+
+            if ($descExists) {
+                $sql = "UPDATE " . TBL_PREFIX . "ocfilter_page_description SET
+                            meta_title = :meta_title, meta_keyword = :meta_keyword,
+                            meta_description = :meta_description, description = :description,
+                            title = :title, name = :name, button = :button
+                        WHERE ocfilter_page_id = :id AND language_id = :lang";
+                $stmt = db()->prepare($sql);
+                $stmt->execute($descFields + ["id" => $pageId, "lang" => LANGUAGE_ID]);
+            } else {
+                $sql = "INSERT INTO " . TBL_PREFIX . "ocfilter_page_description
+                            (ocfilter_page_id, language_id, meta_title, meta_keyword, meta_description, description, title, name, button)
+                        VALUES (:id, :lang, :meta_title, :meta_keyword, :meta_description, :description, :title, :name, :button)";
+                $stmt = db()->prepare($sql);
+                $stmt->execute($descFields + ["id" => $pageId, "lang" => LANGUAGE_ID]);
+            }
+
+            db()->commit();
+
+            $report[$idx]["status"] = "applied";
+            $report[$idx]["ocfilter_page_id"] = $pageId;
+            $changed = true;
+            echo "готово (ocfilter_page_id={$pageId}).\n";
+        } catch (\Throwable $e) {
+            if (db()->inTransaction()) {
+                db()->rollBack();
+            }
+            echo "ОШИБКА: {$e->getMessage()}\n";
+            $report[$idx]["status"] = "error";
+            $report[$idx]["error"] = $e->getMessage();
+            $changed = true;
+        }
+
+        if ($changed) {
+            file_put_contents($reportFile, json_encode(array_values($report), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+        }
+    }
+
+    echo "\nГотово.\n";
+}
+
+function getOcFilterPageUrl($keyword)
+{
+    return SITE_PROTOCOL . "://" . SITE_HOST . "/" . $keyword;
+}
+
+// ==================== РЕЖИМ: APPLY ====================
+
+function runApply($sectionId, $scope = "all")
+{
+    if (empty($sectionId)) {
+        echo "Ошибка: не указана категория. Запусти как: php ai_generate_descriptions_oc.php apply <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        exit(1);
+    }
+
+    $scope = normalizeProductScope($scope);
+    $reportFile = getReportFile($sectionId, $scope);
+
+    if (!file_exists($reportFile)) {
+        echo "Файл отчёта не найден: " . $reportFile . ". Сначала запусти review.\n";
+        exit(1);
+    }
+
+    $report = json_decode(file_get_contents($reportFile), true);
+    $changed = false;
+
+    $sql = "UPDATE " . TBL_PREFIX . "product_description
+            SET description = :text
+            WHERE product_id = :id AND language_id = :lang";
+    $stmt = db()->prepare($sql);
+
+    foreach ($report as $idx => $item) {
+        if (($item["status"] ?? "") !== "approved") {
+            echo "ID {$item['id']}: пропуск (статус: {$item['status']}, не 'approved')\n";
+            continue;
+        }
+
+        try {
+            $stmt->execute([
+                "text" => $item["detail_text"],
+                "id" => $item["id"],
+                "lang" => LANGUAGE_ID,
+            ]);
+
+            // Обновляем date_modified самого товара. Это корректно отражает факт
+            // изменения карточки и позволяет генератору sitemap использовать свежий
+            // <lastmod>, если он строится по product.date_modified.
+            try {
+                $touchStmt = db()->prepare(
+                    "UPDATE " . TBL_PREFIX . "product SET date_modified = NOW() WHERE product_id = :id"
+                );
+                $touchStmt->execute(["id" => $item["id"]]);
+            } catch (\Throwable $touchError) {
+                echo "ID {$item['id']}: предупреждение — не удалось обновить date_modified: {$touchError->getMessage()}\n";
+            }
+
+            echo "ID {$item['id']}: описание обновлено.\n";
+            $report[$idx]["status"] = "applied";
+            $report[$idx]["applied_at"] = date("c");
+            $changed = true;
+        } catch (\Throwable $e) {
+            echo "ID {$item['id']}: ОШИБКА при обновлении — {$e->getMessage()}\n";
+        }
+    }
+
+    if ($changed) {
+        file_put_contents($reportFile, json_encode($report, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    }
+
+    echo "\nГотово. Если у магазина настроено кэширование (файловое/Redis/Memcached) —\n";
+    echo "очисти кэш каталога через админку (Система -> Обслуживание -> Очистить кэш).\n";
+}
+
+// ==================== ЗАПУСК ====================
+
+$mode = $argv[1] ?? "";
+$sectionArg = isset($argv[2]) ? (int)$argv[2] : $DEFAULT_SECTION_ID;
+$limitArg = isset($argv[3]) ? (int)$argv[3] : 0;
+$extraInstructions = "";
+$productScopeArg = getProductScopeFromArgv($argv);
+
+switch ($mode) {
+    case "review":
+        runReview($sectionArg, $extraInstructions, $limitArg, $productScopeArg);
+        break;
+
+    case "apply":
+        runApply($sectionArg, $productScopeArg);
+        break;
+
+    case "preview":
+        $previewProductId = $limitArg ?: null;
+        if (!$previewProductId) {
+            echo "Использование: php ai_generate_descriptions_oc.php preview <CATEGORY_ID> <PRODUCT_ID>\n";
+            exit(1);
+        }
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
+        if (!file_exists($reportFile)) {
+            echo "Файл отчёта не найден: {$reportFile}\n";
+            exit(1);
+        }
+        $report = json_decode(file_get_contents($reportFile), true);
+        $found = null;
+        foreach ($report as $item) {
+            if ((string)$item["id"] === (string)$previewProductId) {
+                $found = $item;
+                break;
+            }
+        }
+        if (!$found) {
+            echo "Товар {$previewProductId} не найден в отчёте {$reportFile}\n";
+            exit(1);
+        }
+        $previewFile = __DIR__ . "/preview_{$previewProductId}.html";
+        $previewHtml = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            . "<title>Превью: {$found['name']}</title>"
+            . "<style>body{font-family:sans-serif;max-width:800px;margin:40px auto;padding:0 20px;}</style>"
+            . "</head><body><h1>{$found['name']}</h1>"
+            . ($found["detail_text"] ?? "(пусто)")
+            . "</body></html>";
+        file_put_contents($previewFile, $previewHtml);
+        echo "Сохранено: {$previewFile}\n";
+        break;
+
+    case "dumpprompt":
+        $productId = $limitArg ?: null;
+        if (!$productId) {
+            echo "Использование: php ai_generate_descriptions_oc.php dumpprompt <CATEGORY_ID> <PRODUCT_ID>\n";
+            exit(1);
+        }
+        $product = getProductContext($productId);
+        if (!$product) {
+            echo "Товар {$productId} не найден.\n";
+            exit(1);
+        }
+        $prompt = buildPrompt($product, $sectionArg, $extraInstructions, $GLOBALS['SECTION_PROMPT_FILES']);
+        echo "Размер промпта: " . mb_strlen($prompt) . " символов\n";
+        echo "--- ПРОМПТ ---\n{$prompt}\n";
+        break;
+
+    case "count":
+        $elementIds = getElementIdsBySection($sectionArg, $productScopeArg);
+        $totalInSection = count($elementIds);
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
+        $generated = 0;
+        $applied = 0;
+        if (file_exists($reportFile)) {
+            $report = json_decode(file_get_contents($reportFile), true);
+            if (is_array($report)) {
+                foreach ($report as $item) {
+                    $status = $item["status"] ?? "";
+                    if (in_array($status, ["approved", "applied"], true)) {
+                        $generated++;
+                    }
+                    if ($status === "applied") {
+                        $applied++;
+                    }
+                }
+            }
+        }
+        echo "\nРежим: " . productScopeLabel($productScopeArg) . "\n";
+        echo "Категория {$sectionArg}: сгенерировано и одобрено — {$generated} товаров из {$totalInSection}\n";
+        echo "Из них применено — {$applied} из {$totalInSection}\n";
+        break;
+
+    case "listreadyids":
+        // Показываем отчёты всех трёх режимов отдельно, чтобы не смешивать
+        // статистику одной и той же категории. Старый файл без суффикса = all.
+        $reportFiles = glob(__DIR__ . "/ai_desc_report_section_*.json");
+        $readySections = [];
+        foreach ($reportFiles as $reportFilePath) {
+            if (!preg_match('/ai_desc_report_section_(\d+)(?:_(google_indexable|google_impressions))?\.json$/', $reportFilePath, $m)) {
+                continue;
+            }
+
+            $reportCategoryId = (int)$m[1];
+            $reportScope = !empty($m[2]) ? $m[2] : "all";
+            $reportData = json_decode(file_get_contents($reportFilePath), true);
+            if (!is_array($reportData)) {
+                continue;
+            }
+
+            $readyCount = 0;
+            $appliedCount = 0;
+            foreach ($reportData as $reportItem) {
+                $status = $reportItem["status"] ?? "";
+                if (in_array($status, ["approved", "applied"], true)) {
+                    $readyCount++;
+                }
+                if ($status === "applied") {
+                    $appliedCount++;
+                }
+            }
+            if ($readyCount === 0) {
+                continue;
+            }
+
+            $categoryName = "";
+            try {
+                $catStmt = db()->prepare(
+                    "SELECT name FROM " . TBL_PREFIX . "category_description
+                     WHERE category_id = :id AND language_id = :lang LIMIT 1"
+                );
+                $catStmt->execute(["id" => $reportCategoryId, "lang" => LANGUAGE_ID]);
+                $catRow = $catStmt->fetch(PDO::FETCH_ASSOC);
+                $categoryName = $catRow["name"] ?? "";
+            } catch (\Throwable $e) {
+                // категория могла быть удалена
+            }
+
+            $readySections[] = [
+                "category_id" => $reportCategoryId,
+                "scope" => $reportScope,
+                "name" => $categoryName,
+                "ready" => $readyCount,
+                "applied" => $appliedCount,
+            ];
+        }
+
+        usort($readySections, function ($a, $b) {
+            $cmp = $a["category_id"] <=> $b["category_id"];
+            if ($cmp !== 0) {
+                return $cmp;
+            }
+            return strcmp($a["scope"], $b["scope"]);
+        });
+
+        echo "Отчётов категорий с готовыми текстами товаров — " . count($readySections) . "\n";
+        foreach ($readySections as $readyInfo) {
+            $scopeLabel = productScopeLabel($readyInfo["scope"]);
+            $countsStr = "готово: {$readyInfo['ready']}, на сайте: {$readyInfo['applied']}";
+            $namePart = $readyInfo["name"] !== "" ? " - {$readyInfo['name']}" : "";
+            echo "{$readyInfo['category_id']}{$namePart} [{$scopeLabel}] ({$countsStr})\n";
+        }
+        break;
+
+    case "listreadyocfilterids":
+        // То же самое, но для SEO-страниц OCFilter. Партия (batch) не всегда
+        // равна ID категории 1:1, поэтому сканируем ВСЕ файлы
+        // ai_ocfilter_report_batch_<BATCH_ID>.json и для каждой партии с
+        // готовыми страницами показываем сам ID партии, название(я)
+        // категори(й), реально встретившиеся в готовых записях этой партии,
+        // и сколько страниц готово. Вывод отсортирован по возрастанию ID партии.
+        $ocReportFiles = glob(__DIR__ . "/ai_ocfilter_report_batch_*.json");
+        $readyBatches = []; // batchId => ["names" => [...], "count" => N]
+        foreach ($ocReportFiles as $ocReportFilePath) {
+            if (!preg_match('/ai_ocfilter_report_batch_(.+)\.json$/', $ocReportFilePath, $m)) {
+                continue;
+            }
+            $reportBatchId = $m[1];
+            $ocReportData = json_decode(file_get_contents($ocReportFilePath), true);
+            if (!is_array($ocReportData)) {
+                continue;
+            }
+            $readyCount = 0;
+            $appliedCount = 0;
+            $categoryNames = [];
+            foreach ($ocReportData as $ocReportItem) {
+                $status = $ocReportItem["status"] ?? "";
+                if (!in_array($status, ["generated", "applied"], true)) {
+                    continue;
+                }
+                $readyCount++;
+                if ($status === "applied") {
+                    $appliedCount++;
+                }
+                $catName = $ocReportItem["category_name"] ?? "";
+                if ($catName !== "" && !in_array($catName, $categoryNames, true)) {
+                    $categoryNames[] = $catName;
+                }
+            }
+            if ($readyCount === 0) {
+                continue;
+            }
+            $readyBatches[$reportBatchId] = ["names" => $categoryNames, "count" => $readyCount, "applied" => $appliedCount];
+        }
+        uksort($readyBatches, function ($a, $b) {
+            // Партии обычно числовые (= ID категории), но формат не гарантирован -
+            // сортируем как числа, если оба числовые, иначе как строки.
+            if (ctype_digit($a) && ctype_digit($b)) {
+                return (int)$a <=> (int)$b;
+            }
+            return strcmp($a, $b);
+        });
+        echo "Партий с готовыми SEO-страницами — " . count($readyBatches) . "\n";
+        foreach ($readyBatches as $readyBatchId => $readyBatchInfo) {
+            $namesStr = implode(", ", $readyBatchInfo["names"]);
+            $countsStr = "готово: {$readyBatchInfo['count']}, на сайте: {$readyBatchInfo['applied']}";
+            echo $namesStr !== ""
+                ? "{$readyBatchId} - {$namesStr} ({$countsStr})\n"
+                : "{$readyBatchId} ({$countsStr})\n";
+        }
+        break;
+
+    case "listapplied":
+        $elementIds = getElementIdsBySection($sectionArg, $productScopeArg);
+        $totalInSection = count($elementIds);
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
+        if (!file_exists($reportFile)) {
+            echo "Файл отчёта не найден: {$reportFile}\n";
+            exit(1);
+        }
+        $report = json_decode(file_get_contents($reportFile), true);
+        $applied = array_filter($report, fn($item) => ($item["status"] ?? "") === "applied");
+        echo "\n";
+        foreach ($applied as $item) {
+            echo "{$item['id']}: {$item['name']}\n";
+        }
+        echo "\nКатегория {$sectionArg}: применено — " . count($applied) . " товаров из {$totalInSection}.\n";
+        break;
+
+    // ---------- OCFilter: SEO-страницы фильтров ----------
+
+    case "genocfilter":
+        // $sectionArg тут используется как ID партии (batch) — просто метка
+        // для имени файлов отчёта/входного списка, не ID категории напрямую
+        // (категория для каждой страницы берётся из самой строки списка).
+        runGenOcFilter($sectionArg, $limitArg);
+        break;
+
+    case "applyocfilter":
+        runApplyOcFilter($sectionArg);
+        break;
+
+    case "countocfilter":
+        $ocReportFile = getOcFilterReportFile($sectionArg);
+        $ocGenerated = 0;
+        $ocApplied = 0;
+        $ocErrors = 0;
+        if (file_exists($ocReportFile)) {
+            $ocReport = json_decode(file_get_contents($ocReportFile), true);
+            if (is_array($ocReport)) {
+                foreach ($ocReport as $item) {
+                    $status = $item["status"] ?? "";
+                    if (in_array($status, ["generated", "applied"], true)) {
+                        $ocGenerated++;
+                    }
+                    if ($status === "applied") {
+                        $ocApplied++;
+                    }
+                    if ($status === "error") {
+                        $ocErrors++;
+                    }
+                }
+            }
+        } else {
+            echo "Файл отчёта не найден: {$ocReportFile}\n";
+            exit(0);
+        }
+        echo "\nПартия {$sectionArg}: сгенерировано — {$ocGenerated}, применено — {$ocApplied}, ошибок — {$ocErrors}\n";
+        break;
+
+    case "listappliedocfilter":
+        $ocReportFile = getOcFilterReportFile($sectionArg);
+        if (!file_exists($ocReportFile)) {
+            echo "Файл отчёта не найден: {$ocReportFile}\n";
+            exit(1);
+        }
+        $ocReport = json_decode(file_get_contents($ocReportFile), true);
+        $ocApplied = array_filter($ocReport, fn($item) => ($item["status"] ?? "") === "applied");
+        echo "\n";
+        foreach ($ocApplied as $item) {
+            echo "{$item['keyword']}: {$item['name']} — " . getOcFilterPageUrl($item['keyword']) . "\n";
+        }
+        echo "\nПартия {$sectionArg}: применено — " . count($ocApplied) . " страниц.\n";
+        break;
+
+    case "indexnowocfilter":
+        // Отдельная РУЧНАЯ команда — не вызывается автоматически из
+        // applyocfilter, т.к. пока идёт тестирование модуля, страницы не
+        // должны сами собой улетать в IndexNow при каждом apply.
+        ensureIndexNowKeyFile();
+        $ocReportFile = getOcFilterReportFile($sectionArg);
+        if (!file_exists($ocReportFile)) {
+            echo "Файл отчёта не найден: {$ocReportFile}\n";
+            exit(1);
+        }
+        $ocReport = json_decode(file_get_contents($ocReportFile), true);
+        $ocUrls = [];
+        foreach ($ocReport as $item) {
+            if (($item["status"] ?? "") === "applied") {
+                $ocUrls[] = getOcFilterPageUrl($item["keyword"]);
+            }
+        }
+        if (empty($ocUrls)) {
+            echo "В партии {$sectionArg} нет применённых SEO-страниц.\n";
+            exit(0);
+        }
+        echo "Отправляю " . count($ocUrls) . " URL в IndexNow...\n";
+        $ocResult = submitIndexNow($ocUrls);
+        if (isset($ocResult["error"])) {
+            echo "ОШИБКА: {$ocResult['error']}\n";
+            exit(1);
+        }
+        foreach ($ocResult["results"] as $batchResult) {
+            echo "Пакет из {$batchResult['batch_size']} URL — HTTP {$batchResult['http_code']}\n";
+        }
+        break;
+
+    case "buildlinks":
+        echo "Обновляю каталог внутренней перелинковки из БД...\n";
+        $linkCatalog = ensureInternalLinksCatalog(true);
+        if (isset($linkCatalog["error"])) {
+            echo "ОШИБКА: {$linkCatalog['error']}\n";
+            exit(1);
+        }
+        $categoryCount = 0;
+        $ocfilterCount = 0;
+        foreach ($linkCatalog["links"] as $linkItem) {
+            if (($linkItem["type"] ?? "") === "category") $categoryCount++;
+            if (($linkItem["type"] ?? "") === "ocfilter") $ocfilterCount++;
+        }
+        echo "Категорий: {$categoryCount}\n";
+        echo "SEO-страниц OCFilter: {$ocfilterCount}\n";
+        echo "Всего URL: " . count($linkCatalog["links"]) . "\n";
+        echo "Файл: " . INTERNAL_LINKS_CATALOG_FILE . "\n";
+        break;
+
+    case "whichprompt":
+        // GUI уже вызывал эту команду для подсветки текущего привязанного
+        // файла при открытии редактора, но самой команды в скрипте не было
+        // (пустой вывод молча игнорировался GUI) — добавлена сейчас.
+        if (!$sectionArg) {
+            echo "Использование: php ai_generate_descriptions_oc.php whichprompt <CATEGORY_ID>\n";
+            exit(1);
+        }
+        echo basename(getPromptFilePath($sectionArg, $GLOBALS['SECTION_PROMPT_FILES'])) . "\n";
+        break;
+
+    case "bindprompt":
+        $filenameToBind = $argv[3] ?? null;
+        if (!$sectionArg || !$filenameToBind) {
+            echo "Использование: php ai_generate_descriptions_oc.php bindprompt <CATEGORY_ID> <FILENAME>\n";
+            exit(1);
+        }
+        $promptPathToBind = PROMPTS_DIR . "/" . $filenameToBind;
+        if (!file_exists($promptPathToBind)) {
+            echo "Файл prompts/{$filenameToBind} не найден.\n";
+            exit(1);
+        }
+        $mapping = loadSectionPromptFiles();
+        $mapping[(string)$sectionArg] = $filenameToBind;
+        try {
+            saveSectionPromptFiles($mapping);
+            echo "Привязка обновлена: категория {$sectionArg} -> prompts/{$filenameToBind}\n";
+        } catch (\Throwable $e) {
+            echo "ОШИБКА: {$e->getMessage()}\n";
+            exit(1);
+        }
+        break;
+
+    case "unbindprompt":
+        if (!$sectionArg) {
+            echo "Использование: php ai_generate_descriptions_oc.php unbindprompt <CATEGORY_ID>\n";
+            exit(1);
+        }
+        $mapping = loadSectionPromptFiles();
+        if (isset($mapping[(string)$sectionArg])) {
+            unset($mapping[(string)$sectionArg]);
+            try {
+                saveSectionPromptFiles($mapping);
+                echo "Привязка для категории {$sectionArg} удалена.\n";
+            } catch (\Throwable $e) {
+                echo "ОШИБКА: {$e->getMessage()}\n";
+                exit(1);
+            }
+        } else {
+            echo "У категории {$sectionArg} и так не было отдельной привязки.\n";
+        }
+        break;
+
+    case "listmapping":
+        $mapping = loadSectionPromptFiles();
+        if (empty($mapping)) {
+            echo "Привязок нет — все категории используют default.txt.\n";
+            break;
+        }
+        foreach ($mapping as $secId => $file) {
+            echo "Категория {$secId} -> prompts/{$file}\n";
+        }
+        break;
+
+    case "listprompts":
+        if (!is_dir(PROMPTS_DIR)) {
+            echo "Папка промптов не найдена: " . PROMPTS_DIR . "\n";
+            exit(1);
+        }
+        $files = glob(PROMPTS_DIR . "/*.txt");
+        foreach ($files as $f) {
+            echo basename($f) . "\n";
+        }
+        break;
+
+    // ---------- Промпты SEO-страниц OCFilter (отдельная папка/привязки) ----------
+    // Тот же принцип, что и у обычных товарных промптов выше (listprompts/
+    // whichprompt/bindprompt/unbindprompt), но папка — OCFILTER_PROMPTS_DIR,
+    // а ключи привязки в общем файле section_mapping.json — с префиксом
+    // "ocfilter_", чтобы не пересекаться с ID категорий товаров.
+
+    case "listocfilterprompts":
+        ensureOcFilterDefaultPrompt();
+        $ocFiles = glob(OCFILTER_PROMPTS_DIR . "/*.txt");
+        foreach ($ocFiles as $f) {
+            echo basename($f) . "\n";
+        }
+        break;
+
+    case "whichocfilterprompt":
+        if (!$sectionArg) {
+            echo "Использование: php ai_generate_descriptions_oc.php whichocfilterprompt <BATCH_ID>\n";
+            exit(1);
+        }
+        ensureOcFilterDefaultPrompt();
+        echo basename(getOcFilterPromptFilePath($sectionArg, $GLOBALS['SECTION_PROMPT_FILES'])) . "\n";
+        break;
+
+    case "bindocfilterprompt":
+        $ocFilenameToBind = $argv[3] ?? null;
+        if (!$sectionArg || !$ocFilenameToBind) {
+            echo "Использование: php ai_generate_descriptions_oc.php bindocfilterprompt <BATCH_ID> <FILENAME>\n";
+            exit(1);
+        }
+        $ocPromptPathToBind = OCFILTER_PROMPTS_DIR . "/" . $ocFilenameToBind;
+        if (!file_exists($ocPromptPathToBind)) {
+            echo "Файл prompts/ocfilter/{$ocFilenameToBind} не найден.\n";
+            exit(1);
+        }
+        $ocMapping = loadSectionPromptFiles();
+        $ocMapping["ocfilter_" . $sectionArg] = $ocFilenameToBind;
+        try {
+            saveSectionPromptFiles($ocMapping);
+            echo "Привязка обновлена: партия {$sectionArg} -> prompts/ocfilter/{$ocFilenameToBind}\n";
+        } catch (\Throwable $e) {
+            echo "ОШИБКА: {$e->getMessage()}\n";
+            exit(1);
+        }
+        break;
+
+    case "unbindocfilterprompt":
+        if (!$sectionArg) {
+            echo "Использование: php ai_generate_descriptions_oc.php unbindocfilterprompt <BATCH_ID>\n";
+            exit(1);
+        }
+        $ocMapping = loadSectionPromptFiles();
+        $ocKey = "ocfilter_" . $sectionArg;
+        if (isset($ocMapping[$ocKey])) {
+            unset($ocMapping[$ocKey]);
+            try {
+                saveSectionPromptFiles($ocMapping);
+                echo "Привязка для партии {$sectionArg} удалена (снова используется default.txt).\n";
+            } catch (\Throwable $e) {
+                echo "ОШИБКА: {$e->getMessage()}\n";
+                exit(1);
+            }
+        } else {
+            echo "У партии {$sectionArg} и так не было отдельной привязки.\n";
+        }
+        break;
+
+    case "showdesc":
+        // Быстрый просмотр текущего description товара прямо из консоли,
+        // без похода в phpMyAdmin. Использование:
+        //   php ai_generate_descriptions_oc.php showdesc 0 <PRODUCT_ID>
+        // (первый аргумент — категория — здесь не используется, но нужен
+        // для единообразия с остальными командами; можно передать 0)
+        $productIdToShow = $limitArg ?: null;
+        if (!$productIdToShow) {
+            echo "Использование: php ai_generate_descriptions_oc.php showdesc 0 <PRODUCT_ID>\n";
+            exit(1);
+        }
+        $sql = "SELECT product_id, name, description
+                FROM " . TBL_PREFIX . "product_description
+                WHERE product_id = :id AND language_id = :lang";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["id" => $productIdToShow, "lang" => LANGUAGE_ID]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) {
+            echo "Товар {$productIdToShow} не найден.\n";
+            exit(1);
+        }
+        echo "ID: {$row['product_id']}\n";
+        echo "Название: {$row['name']}\n";
+        echo "Длина description: " . mb_strlen($row['description']) . " символов\n";
+        echo "--- DESCRIPTION ---\n";
+        echo $row['description'] . "\n";
+        echo "--- КОНЕЦ ---\n";
+        break;
+
+    case "listmissingfooter":
+        // При миллионах товаров нельзя вытаскивать и печатать каждую строку —
+        // считаем количество через COUNT(*) и показываем небольшую выборку
+        // названий (LIMIT 10) просто для проверки, что фильтр отбирает то,
+        // что нужно.
+        $countSql = "SELECT COUNT(*) AS cnt
+                     FROM " . TBL_PREFIX . "product_description
+                     WHERE language_id = :lang
+                       AND description != ''
+                       AND description NOT LIKE '%EMAIL%'";
+        $stmt = db()->prepare($countSql);
+        $stmt->execute(["lang" => LANGUAGE_ID]);
+        $total = (int)$stmt->fetch(PDO::FETCH_ASSOC)["cnt"];
+
+        echo "Товаров с непустым description БЕЗ коммерческого блока: {$total}\n\n";
+
+        if ($total > 0) {
+            echo "Пример первых 10 (для проверки, что фильтр верный):\n";
+            $sampleSql = "SELECT product_id, name
+                          FROM " . TBL_PREFIX . "product_description
+                          WHERE language_id = :lang
+                            AND description != ''
+                            AND description NOT LIKE '%EMAIL%'
+                          LIMIT 10";
+            $sampleStmt = db()->prepare($sampleSql);
+            $sampleStmt->execute(["lang" => LANGUAGE_ID]);
+            foreach ($sampleStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                echo "{$row['product_id']}: {$row['name']}\n";
+            }
+        }
+        break;
+
+    case "fixphonefooter":
+        // Разовая миграция: у части товаров (уже обработанных addfooterall
+        // ДО того, как обнаружили путаницу %TELEPHONE%/%PHONE%) сейчас лежит
+        // старая версия блока с пустым телефоном. Точечно заменяем именно
+        // этот старый текст на новый, не трогая остальные товары.
+        $oldFooter = <<<'OLDFOOTER'
+<p>Налаживание надежных партнерских отношений, развитие логистической цепи, улучшение технологических процессов производства на промышленных объектах компании – это то, чему постоянно уделяется большое внимание.</p>
+
+<p>ООО Ферус, г. %CITY%, предлагает Вам приобрести по выгодной цене. Реализация продукции оптом и в розницу, с складов компании. Условия доставки и другую информацию, касательно покупки Вы можете уточнить у менеджеров компании по телефону или электронной почте:</p>
+
+<p><strong>%TELEPHONE%</strong></p>
+
+<p><strong>%EMAIL%</strong></p>
+OLDFOOTER;
+
+        $selectSql = "SELECT product_id, description
+                      FROM " . TBL_PREFIX . "product_description
+                      WHERE language_id = :lang
+                        AND description LIKE '%<p><strong>%TELEPHONE%%'";
+        $stmt = db()->prepare($selectSql);
+        $stmt->execute(["lang" => LANGUAGE_ID]);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        if (empty($rows)) {
+            echo "Не найдено товаров со старой версией блока. Нечего исправлять.\n";
+            break;
+        }
+
+        echo "Найдено товаров со старым блоком: " . count($rows) . "\n";
+
+        $updateSql = "UPDATE " . TBL_PREFIX . "product_description
+                      SET description = :new_desc
+                      WHERE product_id = :id AND language_id = :lang";
+        $updateStmt = db()->prepare($updateSql);
+
+        $fixed = 0;
+        foreach ($rows as $row) {
+            if (strpos($row["description"], $oldFooter) === false) {
+                continue; // на всякий случай, вдруг LIKE зацепил что-то другое
+            }
+            $newDescription = str_replace($oldFooter, COMMERCIAL_FOOTER_HTML, $row["description"]);
+            $updateStmt->execute([
+                "new_desc" => $newDescription,
+                "id" => $row["product_id"],
+                "lang" => LANGUAGE_ID,
+            ]);
+            $fixed++;
+        }
+
+        echo "Исправлено товаров: {$fixed}\n";
+        break;
+
+    case "addfooterall":
+        // Дописывает коммерческий блок ВСЕМ товарам с непустым description,
+        // у которых его ещё нет. Рассчитано на миллионы записей:
+        // - обрабатывает пачками (по умолчанию 2000 за раз), а не по одной строке;
+        // - один UPDATE на пачку (через IN(...)), а не отдельный запрос на каждый товар;
+        // - идемпотентно и безопасно прерывать/перезапускать: уже обработанные
+        //   строки (содержащие %EMAIL% — маркер того, что контактный блок
+        //   уже есть в каком-либо виде, старом или новом) перестают попадать в выборку,
+        //   так что повторный запуск просто продолжит с того места, где остановились.
+        $batchSize = 2000;
+        $totalUpdated = 0;
+        $startTime = time();
+
+        while (true) {
+            $selectSql = "SELECT product_id
+                          FROM " . TBL_PREFIX . "product_description
+                          WHERE language_id = :lang
+                            AND description != ''
+                            AND description NOT LIKE '%EMAIL%'
+                          LIMIT :batch";
+            $selectStmt = db()->prepare($selectSql);
+            $selectStmt->bindValue(":lang", LANGUAGE_ID, PDO::PARAM_INT);
+            $selectStmt->bindValue(":batch", $batchSize, PDO::PARAM_INT);
+            $selectStmt->execute();
+            $ids = $selectStmt->fetchAll(PDO::FETCH_COLUMN);
+
+            if (empty($ids)) {
+                break;
+            }
+
+            $placeholders = implode(",", array_fill(0, count($ids), "?"));
+            $updateSql = "UPDATE " . TBL_PREFIX . "product_description
+                          SET description = CONCAT(description, ?, ?)
+                          WHERE language_id = ? AND product_id IN ({$placeholders})";
+            $updateStmt = db()->prepare($updateSql);
+            $params = array_merge(["\n\n", COMMERCIAL_FOOTER_HTML, LANGUAGE_ID], $ids);
+            $updateStmt->execute($params);
+
+            $totalUpdated += count($ids);
+            $elapsed = time() - $startTime;
+            echo "Обработано: {$totalUpdated} (за {$elapsed} сек)\n";
+
+            // Небольшая пауза между пачками, чтобы не держать таблицу под
+            // непрерывной нагрузкой на живом продакшн-сайте.
+            usleep(200000);
+        }
+
+        echo "\nГотово. Всего обновлено товаров: {$totalUpdated}\n";
+        break;
+
+        echo "\nГотово. Блок добавлен к {$count} товарам.\n";
+        break;
+
+    case "touchapplied":
+        runTouchApplied($sectionArg, $productScopeArg);
+        break;
+
+    case "googlerefresh":
+        runGoogleRefresh($sectionArg, $productScopeArg);
+        break;
+
+    case "indexnow":
+        $keyFilePath = ensureIndexNowKeyFile();
+        echo "Файл-подтверждение IndexNow: {$keyFilePath}\n";
+
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
+        if (!file_exists($reportFile)) {
+            echo "Файл отчёта не найден: {$reportFile}\n";
+            exit(1);
+        }
+        $report = json_decode(file_get_contents($reportFile), true);
+        $appliedIds = [];
+        foreach ($report as $item) {
+            if (($item["status"] ?? "") === "applied") {
+                $appliedIds[] = $item["id"];
+            }
+        }
+
+        if (empty($appliedIds)) {
+            echo "В категории {$sectionArg} нет товаров со статусом 'applied'.\n";
+            exit(0);
+        }
+
+        echo "Собираю URL для " . count($appliedIds) . " товаров...\n";
+        $urls = [];
+        foreach ($appliedIds as $id) {
+            $url = getProductUrl($id);
+            if ($url) {
+                $urls[] = $url;
+            } else {
+                echo "  ID {$id}: не удалось получить URL, пропуск.\n";
+            }
+        }
+
+        echo "Отправляю " . count($urls) . " URL в IndexNow...\n";
+        $result = submitIndexNow($urls);
+
+        if (isset($result["error"])) {
+            echo "ОШИБКА: {$result['error']}\n";
+            exit(1);
+        }
+
+        foreach ($result["results"] as $batchResult) {
+            echo "Пакет из {$batchResult['batch_size']} URL — HTTP {$batchResult['http_code']}\n";
+        }
+        break;
+
+    default:
+        echo "Использование:\n";
+        echo "  php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT] [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php apply <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php preview <CATEGORY_ID> <PRODUCT_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php dumpprompt <CATEGORY_ID> <PRODUCT_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php count <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php listapplied <CATEGORY_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php listprompts\n";
+        echo "  php ai_generate_descriptions_oc.php bindprompt <CATEGORY_ID> <FILENAME>\n";
+        echo "  php ai_generate_descriptions_oc.php unbindprompt <CATEGORY_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php listmapping\n";
+        echo "  php ai_generate_descriptions_oc.php listmissingfooter — показать товары без коммерческого блока в description\n";
+        echo "  php ai_generate_descriptions_oc.php addfooterall     — дописать блок ВСЕМ товарам с описанием, у кого его нет\n";
+        echo "  php ai_generate_descriptions_oc.php indexnow <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php touchapplied <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php googlerefresh <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "\n  OCFilter (SEO-страницы фильтров):\n";
+        echo "  php ai_generate_descriptions_oc.php genocfilter <BATCH_ID> [LIMIT]\n";
+        echo "  php ai_generate_descriptions_oc.php applyocfilter <BATCH_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php countocfilter <BATCH_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php listappliedocfilter <BATCH_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php indexnowocfilter <BATCH_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php listocfilterprompts             — список файлов промптов OCFilter\n";
+        echo "  php ai_generate_descriptions_oc.php whichocfilterprompt <BATCH_ID>  — какой файл привязан к партии\n";
+        echo "  php ai_generate_descriptions_oc.php bindocfilterprompt <BATCH_ID> <FILE> — привязать партию к файлу\n";
+        echo "  php ai_generate_descriptions_oc.php unbindocfilterprompt <BATCH_ID> — убрать привязку (вернуть default.txt)\n";
+}
