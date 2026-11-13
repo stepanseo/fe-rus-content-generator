@@ -1033,8 +1033,9 @@ function callOpenAICompatibleAttempt($prompt)
     $accumulatedText = "";
     $sseBuffer = "";
     $streamError = "";
+    $rawResponse = "";
 
-    $ch = curl_init("https://direct.router-cheap.com/v1/chat/completions");
+    $ch = curl_init("https://router.cheap/v1/chat/completions");
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => $payload,
@@ -1047,7 +1048,8 @@ function callOpenAICompatibleAttempt($prompt)
         CURLOPT_TIMEOUT => 180,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
-        CURLOPT_WRITEFUNCTION => function ($curlHandle, $chunk) use (&$accumulatedText, &$streamError, &$sseBuffer) {
+        CURLOPT_WRITEFUNCTION => function ($curlHandle, $chunk) use (&$accumulatedText, &$streamError, &$sseBuffer, &$rawResponse) {
+            $rawResponse .= $chunk;
             $sseBuffer .= $chunk;
             $lastNewlinePos = strrpos($sseBuffer, "\n");
             if ($lastNewlinePos === false) {
@@ -1097,6 +1099,18 @@ function callOpenAICompatibleAttempt($prompt)
         return ["error" => "API stream error: " . $streamError];
     }
     if ($httpCode !== 200) {
+        $detail = trim((string)$rawResponse);
+        if ($detail !== "") {
+            $decoded = json_decode($detail, true);
+            if (is_array($decoded)) {
+                $detail = $decoded["error"]["message"] ?? $decoded["message"] ?? $detail;
+            }
+            $detail = preg_replace('/\s+/u', ' ', strip_tags((string)$detail));
+            if (mb_strlen($detail) > 500) {
+                $detail = mb_substr($detail, 0, 500) . '...';
+            }
+            return ["error" => "API error ({$httpCode}): {$detail}"];
+        }
         return ["error" => "API error ({$httpCode}), накоплено символов: " . strlen($accumulatedText)];
     }
     if (trim($accumulatedText) === "") {
