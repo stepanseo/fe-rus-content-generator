@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "remote_path": "/var/www/fe-rus/data/www/fe-rus.ru/scripts/content-generator",
     "router_cheap_api_key": "",
     "router_cheap_model": "claude-sonnet-5",
+    "router_cheap_api_style": "anthropic",
 }
 
 
@@ -192,14 +193,29 @@ class App:
         api_key_entry.grid(row=3, column=1, columnspan=3, sticky="w", padx=4, pady=4)
         setup_text_editing_shortcuts(api_key_entry)
 
-        ttk.Label(conn_frame, text="Модель:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(conn_frame, text="Источник API:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        saved_style = self.cfg.get("router_cheap_api_style", "anthropic")
+        self.api_style_var = tk.StringVar(value="GPT" if saved_style in ("gpt", "openai") else "Claude")
+        self.api_style_combo = ttk.Combobox(
+            conn_frame, textvariable=self.api_style_var, state="readonly", width=14,
+            values=("Claude", "GPT"),
+        )
+        self.api_style_combo.grid(row=4, column=1, sticky="w", padx=4, pady=4)
+        self.api_style_combo.bind("<<ComboboxSelected>>", self._on_api_style_changed)
+
+        ttk.Label(conn_frame, text="Модель:").grid(row=4, column=2, sticky="e", padx=4, pady=4)
         self.model_var = tk.StringVar(value=self.cfg["router_cheap_model"])
-        model_entry = ttk.Entry(conn_frame, textvariable=self.model_var, width=25)
-        model_entry.grid(row=4, column=1, sticky="w", padx=4, pady=4)
-        setup_text_editing_shortcuts(model_entry)
+        self.model_combo = ttk.Combobox(conn_frame, textvariable=self.model_var, width=25)
+        self.model_combo.grid(row=4, column=3, sticky="w", padx=4, pady=4)
+        self._refresh_model_choices(keep_current=True)
+
+        ttk.Label(
+            conn_frame,
+            text="GPT: рекомендую gpt-5.6-sol для товарных и SEO-текстов; Claude остаётся резервом.",
+        ).grid(row=5, column=0, columnspan=4, sticky="w", padx=4, pady=(0, 4))
 
         ttk.Button(conn_frame, text="Сохранить настройки подключения", command=self._save_settings).grid(
-            row=5, column=0, columnspan=4, pady=6
+            row=6, column=0, columnspan=4, pady=6
         )
 
         # Статус и лог — общие для обеих вкладок, размещены ВЫШЕ вкладок и с
@@ -306,6 +322,22 @@ class App:
 
     # ---------------------------------------------------------- Настройки
 
+    def _refresh_model_choices(self, keep_current=False):
+        style = self.api_style_var.get().strip() if hasattr(self, "api_style_var") else "Claude"
+        if style == "GPT":
+            values = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna")
+            recommended = "gpt-5.6-sol"
+        else:
+            values = ("claude-sonnet-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2")
+            recommended = "claude-sonnet-5"
+        self.model_combo.configure(values=values)
+        current = self.model_var.get().strip()
+        if not keep_current or not current:
+            self.model_var.set(recommended)
+
+    def _on_api_style_changed(self, event=None):
+        self._refresh_model_choices(keep_current=False)
+
     def _save_settings(self):
         try:
             port = int(self.port_var.get() or 22)
@@ -321,6 +353,7 @@ class App:
             "remote_path": self.path_var.get().strip(),
             "router_cheap_api_key": self.api_key_var.get().strip(),
             "router_cheap_model": self.model_var.get().strip(),
+            "router_cheap_api_style": "openai" if self.api_style_var.get() == "GPT" else "anthropic",
         }
         save_config(self.cfg)
         messagebox.showinfo(
@@ -453,6 +486,7 @@ class App:
             args=(
                 host, port, user, password, remote_path, job_type, section, inner_cmd,
                 self.api_key_var.get().strip(), self.model_var.get().strip(),
+                "openai" if self.api_style_var.get() == "GPT" else "anthropic",
             ),
             daemon=True,
         )
@@ -466,7 +500,7 @@ class App:
         client.get_transport().set_keepalive(30)
         return client
 
-    def _remote_job_worker(self, host, port, user, password, remote_path, job_type, section, inner_cmd, api_key="", model=""):
+    def _remote_job_worker(self, host, port, user, password, remote_path, job_type, section, inner_cmd, api_key="", model="", api_style="anthropic"):
         log_name = f"gui_run_oc_{job_type}_{section}.log"
         pid_name = f"gui_run_oc_{job_type}_{section}.pid"
         log_path = f"{remote_path}/{log_name}"
@@ -482,6 +516,8 @@ class App:
             env_parts.append(f"ROUTER_CHEAP_API_KEY={shlex.quote(api_key)}")
         if model:
             env_parts.append(f"ROUTER_CHEAP_MODEL={shlex.quote(model)}")
+        if api_style:
+            env_parts.append(f"ROUTER_CHEAP_API_STYLE={shlex.quote(api_style)}")
         env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
 
         # Запуск в фоне на сервере: вывод команды идёт в файл лога, PID

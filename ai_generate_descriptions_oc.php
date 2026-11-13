@@ -13,17 +13,19 @@
  *   - Схема oc_seo_url: в разных версиях/форках разная (см. функцию getProductUrl)
  *
  * Запуск (идентично Bitrix-версии):
- *   php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT]
+ *   php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT] [--scope=all|google_indexable|google_impressions]
  *   php ai_generate_descriptions_oc.php apply  <CATEGORY_ID>
  *   php ai_generate_descriptions_oc.php preview <CATEGORY_ID> <PRODUCT_ID>
  *   php ai_generate_descriptions_oc.php dumpprompt <CATEGORY_ID> <PRODUCT_ID>
- *   php ai_generate_descriptions_oc.php count <CATEGORY_ID>
+ *   php ai_generate_descriptions_oc.php count <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]
  *   php ai_generate_descriptions_oc.php listapplied <CATEGORY_ID>
  *   php ai_generate_descriptions_oc.php listprompts
  *   php ai_generate_descriptions_oc.php bindprompt <CATEGORY_ID> <FILENAME>
  *   php ai_generate_descriptions_oc.php unbindprompt <CATEGORY_ID>
  *   php ai_generate_descriptions_oc.php listmapping
- *   php ai_generate_descriptions_oc.php indexnow <CATEGORY_ID>
+ *   php ai_generate_descriptions_oc.php indexnow <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]
+ *   php ai_generate_descriptions_oc.php googlerefresh <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]
+ *   php ai_generate_descriptions_oc.php buildlinks
  *
  *   Модуль OCFilter (SEO-страницы фильтров категорий):
  *   php ai_generate_descriptions_oc.php genocfilter <BATCH_ID> [LIMIT]
@@ -102,11 +104,27 @@ $DEFAULT_SECTION_ID = null;
 // Ключ и модель — ТОЛЬКО из переменной окружения (передаётся GUI-приложением).
 define("ROUTER_CHEAP_API_KEY", getenv("ROUTER_CHEAP_API_KEY") ?: "");
 define("ROUTER_CHEAP_MODEL", getenv("ROUTER_CHEAP_MODEL") ?: "claude-sonnet-5");
+define("ROUTER_CHEAP_API_STYLE", strtolower(getenv("ROUTER_CHEAP_API_STYLE") ?: "anthropic"));
 
 // IndexNow
 define("INDEXNOW_KEY", "f04e68d0e38cc17ebafe6ea66377e523");
 define("SITE_HOST", "fe-rus.ru"); // <-- ЗАПОЛНИ, например "fe-rus.ru"
 define("SITE_PROTOCOL", "https");
+
+// Google Search Console / Sitemap API. По умолчанию используем тот же service account,
+// что и Google Index Manager в соседней папке google_impressions.
+define("GOOGLE_SERVICE_ACCOUNT_JSON", __DIR__ . "/google_impressions/google-service-account.json");
+define("GOOGLE_WEBMASTERS_SCOPE", "https://www.googleapis.com/auth/webmasters");
+define("GOOGLE_MAIN_SITEMAP_PATH", "/sitemap/sitemap_g.xml");
+
+// Внутренняя перелинковка. Каталог строится из активных категорий и
+// активных SEO-страниц OCFilter и используется и для товаров, и для
+// SEO-страниц. href храним относительным, чтобы ссылка оставалась на том
+// же региональном поддомене (chita.fe-rus.ru, spb.fe-rus.ru и т.д.).
+define("INTERNAL_LINKS_CATALOG_FILE", __DIR__ . "/internal_links_catalog.json");
+define("INTERNAL_LINKS_CATALOG_TTL", 86400); // 24 часа
+define("INTERNAL_LINKS_MAX_CANDIDATES", 12);
+define("INTERNAL_LINKS_DEFAULT_MAX_LINKS", 3);
 
 // Фиксированный коммерческий блок, который приклеивается кодом (не ИИ)
 // в конец КАЖДОГО сгенерированного описания. Плейсхолдеры %CITY%/%PHONE%/
@@ -195,12 +213,59 @@ function getPromptFilePath($sectionId, $sectionPromptFiles)
 
 // ==================== СБОР ДАННЫХ О ТОВАРЕ ====================
 
-function getElementIdsBySection($categoryId)
+function normalizeProductScope($scope)
 {
-    $sql = "SELECT p.product_id
+    $allowed = ["all", "google_indexable", "google_impressions"];
+    return in_array($scope, $allowed, true) ? $scope : "all";
+}
+
+function getProductScopeFromArgv($argv)
+{
+    foreach ($argv as $arg) {
+        if (strpos($arg, "--scope=") === 0) {
+            return normalizeProductScope(substr($arg, 8));
+        }
+    }
+    return "all";
+}
+
+function productScopeLabel($scope)
+{
+    $scope = normalizeProductScope($scope);
+    if ($scope === "google_indexable") {
+        return "только открытые для Google";
+    }
+    if ($scope === "google_impressions") {
+        return "открытые для Google + есть показы GSC";
+    }
+    return "все активные товары категории";
+}
+
+function getElementIdsBySection($categoryId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+
+    $sql = "SELECT DISTINCT p.product_id
             FROM " . TBL_PREFIX . "product_to_category ptc
-            INNER JOIN " . TBL_PREFIX . "product p ON p.product_id = ptc.product_id
-            WHERE ptc.category_id = :cat AND p.status = 1";
+            INNER JOIN " . TBL_PREFIX . "product p ON p.product_id = ptc.product_id";
+
+    if ($scope === "google_impressions") {
+        $sql .= " INNER JOIN " . TBL_PREFIX . "seo_index_signal sis
+                  ON sis.product_id = p.product_id";
+    }
+
+    $sql .= " WHERE ptc.category_id = :cat AND p.status = 1";
+
+    if ($scope === "google_indexable" || $scope === "google_impressions") {
+        $sql .= " AND p.google_sitemap_enabled = 1 AND p.googlebot_noindex = 0";
+    }
+
+    if ($scope === "google_impressions") {
+        $sql .= " AND COALESCE(sis.google_impressions, 0) > 0";
+    }
+
+    $sql .= " ORDER BY p.product_id";
+
     $stmt = db()->prepare($sql);
     $stmt->execute(["cat" => $categoryId]);
     $ids = [];
@@ -263,6 +328,442 @@ function getProductContext($productId)
     ];
 }
 
+// ==================== ВНУТРЕННЯЯ ПЕРЕЛИНКОВКА ====================
+
+function normalizeInternalHref($url)
+{
+    $url = html_entity_decode(trim((string)$url), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($url === '') {
+        return '';
+    }
+
+    if (preg_match('~^https?://~i', $url)) {
+        $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+        if ($host !== SITE_HOST && !preg_match('/\\.' . preg_quote(SITE_HOST, '/') . '$/i', $host)) {
+            return '';
+        }
+        $path = (string)parse_url($url, PHP_URL_PATH);
+    } else {
+        $path = $url;
+    }
+
+    $path = '/' . ltrim($path, '/');
+    $path = preg_replace('~/+~', '/', $path);
+    if ($path !== '/') {
+        $path = rtrim($path, '/') . '/';
+    }
+    return $path;
+}
+
+function loadCategorySeoMap()
+{
+    $map = [];
+
+    // Новая схема seo_url: key/value.
+    try {
+        $sql = "SELECT `value` AS category_id, keyword FROM " . TBL_PREFIX . "seo_url
+                WHERE `key` = 'category_id' AND store_id = :store AND language_id = :lang";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["store" => STORE_ID, "lang" => LANGUAGE_ID]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $id = (int)($row['category_id'] ?? 0);
+            $kw = trim((string)($row['keyword'] ?? ''));
+            if ($id > 0 && $kw !== '') {
+                $map[$id] = trim($kw, '/');
+            }
+        }
+    } catch (\Throwable $e) {
+        // Старая схема будет ниже.
+    }
+
+    // Старая схема seo_url: query='category_id=N'.
+    try {
+        $sql = "SELECT query, keyword FROM " . TBL_PREFIX . "seo_url
+                WHERE query LIKE 'category_id=%' AND store_id = :store";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["store" => STORE_ID]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            if (!preg_match('/category_id=(\\d+)/', (string)($row['query'] ?? ''), $m)) {
+                continue;
+            }
+            $id = (int)$m[1];
+            $kw = trim((string)($row['keyword'] ?? ''));
+            if ($id > 0 && $kw !== '') {
+                $map[$id] = trim($kw, '/');
+            }
+        }
+    } catch (\Throwable $e) {
+        // Если обе схемы не подошли, caller получит пустую карту.
+    }
+
+    return $map;
+}
+
+function buildInternalLinksCatalog($writeFile = true)
+{
+    $categorySeo = loadCategorySeoMap();
+    if (empty($categorySeo)) {
+        return ["error" => "Не удалось получить SEO-URL категорий из " . TBL_PREFIX . "seo_url"];
+    }
+
+    $links = [];
+    $seen = [];
+
+    $sql = "SELECT c.category_id, cd.name
+            FROM " . TBL_PREFIX . "category c
+            INNER JOIN " . TBL_PREFIX . "category_description cd
+                ON cd.category_id = c.category_id AND cd.language_id = :lang
+            WHERE c.status = 1";
+    $stmt = db()->prepare($sql);
+    $stmt->execute(["lang" => LANGUAGE_ID]);
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $categoryId = (int)$row['category_id'];
+        if (empty($categorySeo[$categoryId])) {
+            continue;
+        }
+        $href = normalizeInternalHref('/' . $categorySeo[$categoryId] . '/');
+        if ($href === '' || isset($seen[$href])) {
+            continue;
+        }
+        $seen[$href] = true;
+        $links[] = [
+            "type" => "category",
+            "category_id" => $categoryId,
+            "name" => trim((string)$row['name']),
+            "params" => "",
+            "keyword" => $categorySeo[$categoryId],
+            "href" => $href,
+            "url" => SITE_PROTOCOL . "://" . SITE_HOST . $href,
+        ];
+    }
+
+    // SEO-страницы OCFilter. URL строим так же, как реально работает сайт:
+    // /<keyword категории>/<params>/ . Поле page.keyword хранит только
+    // SEO-псевдоним самой страницы и не используется для сборки маршрута.
+    try {
+        $sql = "SELECT p.ocfilter_page_id, p.category_id, p.params, p.keyword,
+                       pd.name AS page_name, cd.name AS category_name
+                FROM " . TBL_PREFIX . "ocfilter_page p
+                LEFT JOIN " . TBL_PREFIX . "ocfilter_page_description pd
+                    ON pd.ocfilter_page_id = p.ocfilter_page_id AND pd.language_id = :lang
+                LEFT JOIN " . TBL_PREFIX . "category_description cd
+                    ON cd.category_id = p.category_id AND cd.language_id = :lang2
+                WHERE p.status = 1";
+        $stmt = db()->prepare($sql);
+        $stmt->execute(["lang" => LANGUAGE_ID, "lang2" => LANGUAGE_ID]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $categoryId = (int)$row['category_id'];
+            $params = trim((string)($row['params'] ?? ''), '/');
+            if ($params === '' || empty($categorySeo[$categoryId])) {
+                continue;
+            }
+            $href = normalizeInternalHref('/' . $categorySeo[$categoryId] . '/' . $params . '/');
+            if ($href === '' || isset($seen[$href])) {
+                continue;
+            }
+            $seen[$href] = true;
+            $pageName = trim((string)($row['page_name'] ?? ''));
+            if ($pageName === '') {
+                $pageName = trim((string)($row['category_name'] ?? '')) . ' ' . str_replace('/', ' ', $params);
+            }
+            $links[] = [
+                "type" => "ocfilter",
+                "ocfilter_page_id" => (int)$row['ocfilter_page_id'],
+                "category_id" => $categoryId,
+                "name" => trim($pageName),
+                "category_name" => trim((string)($row['category_name'] ?? '')),
+                "params" => $params,
+                "keyword" => trim((string)($row['keyword'] ?? '')),
+                "href" => $href,
+                "url" => SITE_PROTOCOL . "://" . SITE_HOST . $href,
+            ];
+        }
+    } catch (\Throwable $e) {
+        return ["error" => "Ошибка чтения OCFilter: " . $e->getMessage()];
+    }
+
+    usort($links, function ($a, $b) {
+        $cmp = strcmp($a['type'], $b['type']);
+        if ($cmp !== 0) return $cmp;
+        $cmp = ((int)$a['category_id']) <=> ((int)$b['category_id']);
+        if ($cmp !== 0) return $cmp;
+        return strcmp($a['href'], $b['href']);
+    });
+
+    $payload = [
+        "generated_at" => date('c'),
+        "site" => SITE_PROTOCOL . "://" . SITE_HOST,
+        "count" => count($links),
+        "links" => $links,
+    ];
+
+    if ($writeFile) {
+        $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if (@file_put_contents(INTERNAL_LINKS_CATALOG_FILE, $json) === false) {
+            return ["error" => "Не удалось записать " . INTERNAL_LINKS_CATALOG_FILE];
+        }
+    }
+
+    return $payload;
+}
+
+function ensureInternalLinksCatalog($force = false)
+{
+    $needBuild = $force || !file_exists(INTERNAL_LINKS_CATALOG_FILE);
+    if (!$needBuild && INTERNAL_LINKS_CATALOG_TTL > 0) {
+        $mtime = @filemtime(INTERNAL_LINKS_CATALOG_FILE);
+        $needBuild = (!$mtime || (time() - $mtime) > INTERNAL_LINKS_CATALOG_TTL);
+    }
+
+    if ($needBuild) {
+        return buildInternalLinksCatalog(true);
+    }
+
+    $data = json_decode((string)@file_get_contents(INTERNAL_LINKS_CATALOG_FILE), true);
+    if (!is_array($data) || !isset($data['links']) || !is_array($data['links'])) {
+        return buildInternalLinksCatalog(true);
+    }
+    return $data;
+}
+
+function internalLinkTokens($text)
+{
+    $text = mb_strtolower(str_replace('ё', 'е', (string)$text), 'UTF-8');
+    preg_match_all('/[a-zа-я0-9]+/u', $text, $m);
+    $stop = array_flip([
+        'для','или','это','как','при','по','из','на','в','с','со','к','от','до','и','а','но','не','же','у','о','об',
+        'товар','товары','продукция','каталог','раздел','страница','марка','тип','вид','размер','гост'
+    ]);
+    $out = [];
+    foreach ($m[0] as $token) {
+        if (mb_strlen($token, 'UTF-8') < 2 || isset($stop[$token])) {
+            continue;
+        }
+        $out[$token] = true;
+    }
+    return array_keys($out);
+}
+
+function loadInternalLinksList()
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+    $data = ensureInternalLinksCatalog(false);
+    if (isset($data['error']) || !isset($data['links']) || !is_array($data['links'])) {
+        $cache = [];
+        return $cache;
+    }
+    $cache = $data['links'];
+    return $cache;
+}
+
+function selectInternalLinkCandidates($contextText, $categoryId = null, $excludeHref = '', $limit = INTERNAL_LINKS_MAX_CANDIDATES)
+{
+    $links = loadInternalLinksList();
+    if (empty($links)) {
+        return [];
+    }
+
+    $contextTokens = array_flip(internalLinkTokens($contextText));
+    $excludeHref = normalizeInternalHref($excludeHref);
+    $scored = [];
+
+    foreach ($links as $link) {
+        $href = normalizeInternalHref($link['href'] ?? $link['url'] ?? '');
+        if ($href === '' || ($excludeHref !== '' && $href === $excludeHref)) {
+            continue;
+        }
+
+        $sameCategory = ($categoryId !== null && (int)($link['category_id'] ?? 0) === (int)$categoryId);
+        $tokens = internalLinkTokens(
+            ($link['name'] ?? '') . ' ' . ($link['category_name'] ?? '') . ' ' . ($link['params'] ?? '') . ' ' . ($link['keyword'] ?? '')
+        );
+        $overlap = 0;
+        foreach ($tokens as $token) {
+            if (isset($contextTokens[$token])) {
+                $overlap++;
+            }
+        }
+
+        $type = $link['type'] ?? '';
+        $score = $overlap * 30;
+
+        if ($sameCategory && $type === 'category') {
+            $score += 200; // родительский раздел — самый естественный кандидат
+        } elseif ($sameCategory && $type === 'ocfilter') {
+            if ($overlap === 0) {
+                continue; // не подсовываем случайные фильтры той же категории
+            }
+            $score += 90;
+        } elseif (!$sameCategory) {
+            if ($overlap < 2) {
+                continue; // другие разделы только при явной текстовой связи
+            }
+            $score += ($type === 'category' ? 25 : 10);
+        }
+
+        if ($score <= 0) {
+            continue;
+        }
+
+        $link['href'] = $href;
+        $link['_score'] = $score;
+        $scored[] = $link;
+    }
+
+    usort($scored, function ($a, $b) {
+        if ($a['_score'] === $b['_score']) {
+            if (($a['type'] ?? '') !== ($b['type'] ?? '')) {
+                return ($a['type'] ?? '') === 'category' ? -1 : 1;
+            }
+            return strcmp((string)$a['href'], (string)$b['href']);
+        }
+        return $b['_score'] <=> $a['_score'];
+    });
+
+    $scored = array_slice($scored, 0, max(1, (int)$limit));
+    foreach ($scored as &$item) {
+        unset($item['_score']);
+    }
+    unset($item);
+    return $scored;
+}
+
+function normalizeInternalLinksMax($value)
+{
+    $value = (int)$value;
+    if ($value < 0) $value = 0;
+    if ($value > 10) $value = 10;
+    return $value;
+}
+
+function extractInternalLinksMaxFromTemplate($template)
+{
+    if (preg_match('/\{\{INTERNAL_LINKS\s*:\s*(\d+)\s*\}\}/i', (string)$template, $m)) {
+        return normalizeInternalLinksMax($m[1]);
+    }
+    return INTERNAL_LINKS_DEFAULT_MAX_LINKS;
+}
+
+function extractInternalLinksMaxFromRenderedPrompt($prompt)
+{
+    if (preg_match('/Максимум внутренних ссылок:\s*(\d+)/ui', (string)$prompt, $m)) {
+        return normalizeInternalLinksMax($m[1]);
+    }
+    return INTERNAL_LINKS_DEFAULT_MAX_LINKS;
+}
+
+function buildInternalLinkPromptBlock($candidates, $maxLinks = INTERNAL_LINKS_DEFAULT_MAX_LINKS)
+{
+    $maxLinks = normalizeInternalLinksMax($maxLinks);
+    if ($maxLinks === 0) {
+        return "\n\nВНУТРЕННЯЯ ПЕРЕЛИНКОВКА:\nМаксимум внутренних ссылок: 0\nНе добавляй <a href> в основной текст.\n";
+    }
+
+    if (empty($candidates)) {
+        return "\n\nВНУТРЕННЯЯ ПЕРЕЛИНКОВКА:\nМаксимум внутренних ссылок: {$maxLinks}\nДля этой страницы подходящих разрешённых ссылок не найдено. Не добавляй <a href> в текст.\n";
+    }
+
+    $lines = [];
+    foreach ($candidates as $item) {
+        $kind = ($item['type'] ?? '') === 'ocfilter' ? 'SEO-страница фильтра' : 'раздел каталога';
+        $name = trim((string)($item['name'] ?? ''));
+        $href = normalizeInternalHref($item['href'] ?? '');
+        if ($href === '') continue;
+        $lines[] = "- {$kind}: {$name} | href={$href}";
+    }
+
+    return "\n\nВНУТРЕННЯЯ ПЕРЕЛИНКОВКА (обязательно соблюдай):\n"
+        . "Максимум внутренних ссылок: {$maxLinks}\n"
+        . "Ниже дан закрытый список разрешённых внутренних ссылок. Добавь от 0 до {$maxLinks} ссылок прямо внутри естественных предложений основного текста. Не стремись использовать максимум: если ссылка неуместна, пропусти её.\n"
+        . "Правила:\n"
+        . "- используй ТОЛЬКО href из списка ниже; запрещено придумывать URL;\n"
+        . "- вставляй ссылку HTML-тегом <a href=\"/путь/\">живой естественный анкор</a>;\n"
+        . "- анкор должен описывать сущность и быть частью нормального предложения;\n"
+        . "- ссылки можно размещать в разных абзацах текста;\n"
+        . "- не используй анкоры «здесь», «по ссылке», «подробнее», «перейти»;\n"
+        . "- не ставь две ссылки рядом и не повторяй один и тот же href;\n"
+        . "- href оставляй относительным, как в списке, чтобы ссылка работала на текущем региональном домене.\n"
+        . "Разрешённые кандидаты:\n" . implode("\n", $lines) . "\n";
+}
+
+function injectInternalLinksBlock($template, $block)
+{
+    // Рекомендуемый вариант: явный плейсхолдер {{INTERNAL_LINKS}} или
+    // {{INTERNAL_LINKS:N}}, где N — максимум ссылок. Для старых промптов,
+    // где плейсхолдера ещё нет, блок дописываем в конец для совместимости.
+    $pattern = '/\{\{INTERNAL_LINKS(?:\s*:\s*\d+)?\s*\}\}/i';
+    if (preg_match($pattern, (string)$template)) {
+        return preg_replace($pattern, trim($block), (string)$template, 1);
+    }
+    return rtrim((string)$template) . $block;
+}
+
+function getAllowedInternalHrefSet()
+{
+    $set = [];
+    foreach (loadInternalLinksList() as $item) {
+        $href = normalizeInternalHref($item['href'] ?? $item['url'] ?? '');
+        if ($href !== '') {
+            $set[$href] = true;
+        }
+    }
+    return $set;
+}
+
+function sanitizeGeneratedInternalLinks($html, $maxLinks = INTERNAL_LINKS_DEFAULT_MAX_LINKS)
+{
+    $maxLinks = normalizeInternalLinksMax($maxLinks);
+    $allowed = getAllowedInternalHrefSet();
+    if (empty($allowed)) {
+        // Если каталог почему-то недоступен, безопаснее убрать ссылки модели,
+        // чем пропустить придуманный URL.
+        return preg_replace('~</?a\\b[^>]*>~is', '', (string)$html);
+    }
+
+    $kept = [];
+    $html = preg_replace_callback(
+        '~<a\\b[^>]*\\bhref\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))[^>]*>(.*?)</a>~is',
+        function ($m) use ($allowed, &$kept, $maxLinks) {
+            $rawHref = $m[1] !== '' ? $m[1] : ($m[2] !== '' ? $m[2] : $m[3]);
+            $href = normalizeInternalHref($rawHref);
+            $inner = $m[4];
+            if ($href === '' || !isset($allowed[$href])) {
+                return $inner; // оставляем живой текст анкоров, но снимаем запрещённую ссылку
+            }
+            if ($maxLinks === 0 || count($kept) >= $maxLinks) {
+                return $inner; // превышение лимита: оставляем текст, но снимаем ссылку
+            }
+            $token = '___FERUS_INTERNAL_LINK_' . count($kept) . '___';
+            $kept[$token] = '<a href="' . htmlspecialchars($href, ENT_QUOTES | ENT_HTML5, 'UTF-8') . '">' . $inner . '</a>';
+            return $token;
+        },
+        (string)$html
+    );
+
+    // Убираем любые непарные/нестандартные теги <a>, которые не прошли
+    // строгую проверку выше, затем возвращаем проверенные ссылки.
+    $html = preg_replace('~</?a\\b[^>]*>~is', '', $html);
+    if (!empty($kept)) {
+        $html = strtr($html, $kept);
+    }
+    return $html;
+}
+
+function extractInternalLinksFromHtml($html)
+{
+    $found = [];
+    if (preg_match_all('~<a\\b[^>]*\\bhref="([^"]+)"[^>]*>~is', (string)$html, $m)) {
+        foreach ($m[1] as $href) {
+            $href = normalizeInternalHref($href);
+            if ($href !== '') $found[$href] = true;
+        }
+    }
+    return array_keys($found);
+}
+
 // ==================== ПРОМПТ ====================
 
 function renderRewriteBlock($product)
@@ -308,35 +809,132 @@ function buildPrompt($product, $sectionId, $extraInstructions, $sectionPromptFil
         "{{REWRITE_BLOCK}}" => $rewriteBlock,
     ];
 
-    return str_replace(array_keys($replacements), array_values($replacements), $template);
+    $internalLinksMax = extractInternalLinksMaxFromTemplate($template);
+    $basePrompt = str_replace(array_keys($replacements), array_values($replacements), $template);
+    $linkContext = $product["name"] . " " . $product["section"] . " " . $propsText;
+    $candidates = selectInternalLinkCandidates($linkContext, (int)$sectionId, "", INTERNAL_LINKS_MAX_CANDIDATES);
+    $linkBlock = buildInternalLinkPromptBlock($candidates, $internalLinksMax);
+    return injectInternalLinksBlock($basePrompt, $linkBlock);
 }
 
 // ==================== ВЫЗОВ CLAUDE API (идентично Bitrix-версии) ====================
 
+function classifyApiError($error)
+{
+    $error = (string)$error;
+
+    if (preg_match('/429/', $error)) {
+        return "rate_limit";
+    }
+    if (preg_match('/(502|503|504)/', $error)) {
+        return "upstream_unavailable";
+    }
+    if (stripos($error, "cURL error:") !== false) {
+        return "transport";
+    }
+    if (stripos($error, "timeout") !== false || stripos($error, "timed out") !== false) {
+        return "transport";
+    }
+
+    return "permanent";
+}
+
+function apiRetryDelaySeconds($type, $attempt)
+{
+    // $attempt — номер НЕУДАЧНОЙ попытки, после которой ждём перед следующей.
+    if ($type === "rate_limit") {
+        $delays = [15, 30, 60, 90];
+    } else {
+        // 502/503/504 и сетевые ошибки.
+        $delays = [5, 15, 30, 60];
+    }
+
+    $index = max(0, min($attempt - 1, count($delays) - 1));
+    return $delays[$index];
+}
+
 function callClaudeAPI($prompt)
 {
-    $maxAttempts = 3;
+    static $consecutiveUpstreamFailures = 0;
+    static $circuitOpen = false;
+
+    // Если три ПОЛНЫХ запроса подряд уже закончились 502/503/504,
+    // на следующем товаре не делаем ни одного внешнего API-вызова.
+    // Предыдущий (третий) товар успевает записаться в отчёт как error.
+    if ($circuitOpen) {
+        fwrite(STDERR, "
+[API GUARD] Остановлено: upstream API недоступен.
+");
+        fwrite(STDERR, "[API GUARD] 3 элемента подряд завершились ошибкой 502/503/504.
+");
+        fwrite(STDERR, "[API GUARD] Уже сохранённые результаты остаются в отчёте. Повтори запуск позже.
+");
+        exit(75);
+    }
+
+    $maxAttempts = 5;
     $lastError = "";
+    $lastType = "permanent";
 
     for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
         if ($attempt > 1) {
-            fwrite(STDERR, "[retry] Попытка {$attempt}/{$maxAttempts}...\n");
-            sleep(3);
+            fwrite(STDERR, "[retry] Попытка {$attempt}/{$maxAttempts}...
+");
         }
 
-        $result = callClaudeAPIAttempt($prompt);
+        $result = callRouterAPIAttempt($prompt);
 
         if (!isset($result["error"])) {
+            // Любой успешный запрос сбрасывает счётчик последовательных падений upstream.
+            $consecutiveUpstreamFailures = 0;
             return $result;
         }
 
         $lastError = $result["error"];
+        $lastType = classifyApiError($lastError);
+
+        // 400/401/403 и прочие постоянные ошибки повторять бессмысленно.
+        if ($lastType === "permanent") {
+            break;
+        }
+
+        if ($attempt < $maxAttempts) {
+            $delay = apiRetryDelaySeconds($lastType, $attempt);
+            fwrite(STDERR, "[retry] Временная ошибка ({$lastType}). Пауза {$delay} сек.
+");
+            sleep($delay);
+        }
     }
 
-    return ["error" => "После {$maxAttempts} попыток: " . $lastError];
+    if ($lastType === "upstream_unavailable") {
+        $consecutiveUpstreamFailures++;
+        fwrite(STDERR, "[API GUARD] Последовательных падений upstream: {$consecutiveUpstreamFailures}/3
+");
+        if ($consecutiveUpstreamFailures >= 3) {
+            // Не exit здесь: вызывающий код сначала запишет третий ошибочный элемент в отчёт.
+            $circuitOpen = true;
+        }
+    } else {
+        // 429, transport и постоянные ошибки не считаем именно как серию падений upstream.
+        $consecutiveUpstreamFailures = 0;
+    }
+
+    return [
+        "error" => "После {$maxAttempts} попыток: " . $lastError,
+        "error_type" => $lastType,
+    ];
 }
 
-function callClaudeAPIAttempt($prompt)
+function callRouterAPIAttempt($prompt)
+{
+    $style = ROUTER_CHEAP_API_STYLE;
+    if ($style === "gpt" || $style === "openai") {
+        return callOpenAICompatibleAttempt($prompt);
+    }
+    return callAnthropicCompatibleAttempt($prompt);
+}
+
+function callAnthropicCompatibleAttempt($prompt)
 {
     $payload = json_encode([
         "model" => ROUTER_CHEAP_MODEL,
@@ -420,6 +1018,94 @@ function callClaudeAPIAttempt($prompt)
     return ["text" => cleanGeneratedText($accumulatedText)];
 }
 
+function callOpenAICompatibleAttempt($prompt)
+{
+    // OpenAI-compatible endpoint Router Cheap. Используется для GPT-моделей.
+    $payload = json_encode([
+        "model" => ROUTER_CHEAP_MODEL,
+        "max_tokens" => 2000,
+        "stream" => true,
+        "messages" => [
+            ["role" => "user", "content" => $prompt],
+        ],
+    ], JSON_UNESCAPED_UNICODE);
+
+    $accumulatedText = "";
+    $sseBuffer = "";
+    $streamError = "";
+
+    $ch = curl_init("https://direct.router-cheap.com/v1/chat/completions");
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_HTTPHEADER => [
+            "Content-Type: application/json",
+            "Authorization: Bearer " . ROUTER_CHEAP_API_KEY,
+            "Accept: text/event-stream",
+        ],
+        CURLOPT_USERAGENT => "curl/7.88.1",
+        CURLOPT_TIMEOUT => 180,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+        CURLOPT_WRITEFUNCTION => function ($curlHandle, $chunk) use (&$accumulatedText, &$streamError, &$sseBuffer) {
+            $sseBuffer .= $chunk;
+            $lastNewlinePos = strrpos($sseBuffer, "\n");
+            if ($lastNewlinePos === false) {
+                return strlen($chunk);
+            }
+            $completeLines = substr($sseBuffer, 0, $lastNewlinePos);
+            $sseBuffer = substr($sseBuffer, $lastNewlinePos + 1);
+
+            foreach (explode("\n", $completeLines) as $line) {
+                $line = trim($line);
+                if (strpos($line, "data:") !== 0) {
+                    continue;
+                }
+                $jsonStr = trim(substr($line, 5));
+                if ($jsonStr === "" || $jsonStr === "[DONE]") {
+                    continue;
+                }
+                $event = json_decode($jsonStr, true);
+                if (!is_array($event)) {
+                    continue;
+                }
+                $delta = $event["choices"][0]["delta"]["content"] ?? null;
+                if (is_string($delta)) {
+                    $accumulatedText .= $delta;
+                }
+                if (isset($event["error"])) {
+                    if (is_array($event["error"])) {
+                        $streamError = $event["error"]["message"] ?? json_encode($event["error"], JSON_UNESCAPED_UNICODE);
+                    } else {
+                        $streamError = (string)$event["error"];
+                    }
+                }
+            }
+            return strlen($chunk);
+        },
+    ]);
+
+    curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        return ["error" => "cURL error: " . $curlError];
+    }
+    if ($streamError) {
+        return ["error" => "API stream error: " . $streamError];
+    }
+    if ($httpCode !== 200) {
+        return ["error" => "API error ({$httpCode}), накоплено символов: " . strlen($accumulatedText)];
+    }
+    if (trim($accumulatedText) === "") {
+        return ["error" => "Пустой ответ от API (GPT stream завершился без текста)"];
+    }
+
+    return ["text" => cleanGeneratedText($accumulatedText)];
+}
+
 function cleanGeneratedText($text)
 {
     $text = trim($text);
@@ -438,6 +1124,357 @@ function cleanGeneratedText($text)
     }
 
     return trim($text);
+}
+
+// ==================== Google Search Console / Sitemap API ====================
+
+function base64UrlEncode($data)
+{
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function getGoogleAccessToken($serviceAccountJson = GOOGLE_SERVICE_ACCOUNT_JSON)
+{
+    if (!file_exists($serviceAccountJson)) {
+        return ["error" => "Не найден service account JSON: {$serviceAccountJson}"];
+    }
+
+    $credentials = json_decode(file_get_contents($serviceAccountJson), true);
+    if (!is_array($credentials)) {
+        return ["error" => "Не удалось прочитать service account JSON: {$serviceAccountJson}"];
+    }
+
+    $clientEmail = $credentials["client_email"] ?? "";
+    $privateKey = $credentials["private_key"] ?? "";
+    $tokenUri = $credentials["token_uri"] ?? "https://oauth2.googleapis.com/token";
+    if ($clientEmail === "" || $privateKey === "") {
+        return ["error" => "В service account JSON нет client_email/private_key"];
+    }
+
+    $now = time();
+    $header = base64UrlEncode(json_encode(["alg" => "RS256", "typ" => "JWT"]));
+    $claim = base64UrlEncode(json_encode([
+        "iss" => $clientEmail,
+        "scope" => GOOGLE_WEBMASTERS_SCOPE,
+        "aud" => $tokenUri,
+        "iat" => $now,
+        "exp" => $now + 3600,
+    ]));
+    $unsigned = $header . "." . $claim;
+
+    $signature = "";
+    $ok = openssl_sign($unsigned, $signature, $privateKey, OPENSSL_ALGO_SHA256);
+    if (!$ok) {
+        return ["error" => "Не удалось подписать JWT service account (openssl_sign)"];
+    }
+
+    $jwt = $unsigned . "." . base64UrlEncode($signature);
+    $ch = curl_init($tokenUri);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => http_build_query([
+            "grant_type" => "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion" => $jwt,
+        ]),
+        CURLOPT_HTTPHEADER => ["Content-Type: application/x-www-form-urlencoded"],
+        CURLOPT_TIMEOUT => 30,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        return ["error" => "OAuth cURL error: {$curlError}"];
+    }
+
+    $data = json_decode((string)$response, true);
+    if ($httpCode !== 200 || !is_array($data) || empty($data["access_token"])) {
+        $message = is_array($data) ? ($data["error_description"] ?? $data["error"] ?? $response) : $response;
+        return ["error" => "OAuth HTTP {$httpCode}: {$message}"];
+    }
+
+    return ["access_token" => $data["access_token"]];
+}
+
+function loadGooglePropertyUrls()
+{
+    $properties = [];
+    $configFile = __DIR__ . "/google_impressions/seo-index-config.php";
+
+    if (file_exists($configFile)) {
+        try {
+            // Поддерживаем оба распространённых варианта config.php:
+            // 1) return [...];  2) $config = [...];
+            $config = null;
+            $returned = include $configFile;
+            if (is_array($returned)) {
+                $config = $returned;
+            }
+            if (!is_array($config) && isset($GLOBALS["config"]) && is_array($GLOBALS["config"])) {
+                $config = $GLOBALS["config"];
+            }
+            if (is_array($config)) {
+                $raw = $config["google"]["properties"] ?? [];
+                if (is_array($raw)) {
+                    foreach ($raw as $item) {
+                        $url = is_array($item) ? ($item["property"] ?? $item["url"] ?? "") : $item;
+                        $url = trim((string)$url);
+                        if ($url !== "") {
+                            $properties[] = rtrim($url, "/") . "/";
+                        }
+                    }
+                }
+                $main = trim((string)($config["google"]["property"] ?? $config["base_url"] ?? ""));
+                if ($main !== "") {
+                    $properties[] = rtrim($main, "/") . "/";
+                }
+            }
+        } catch (\Throwable $e) {
+            // Ниже сработает fallback на основной сайт.
+        }
+    }
+
+    if (empty($properties)) {
+        $properties[] = SITE_PROTOCOL . "://" . SITE_HOST . "/";
+    }
+
+    $properties = array_values(array_unique($properties));
+    sort($properties, SORT_STRING);
+    return $properties;
+}
+
+function submitSitemapToGoogle($accessToken, $propertyUrl, $sitemapUrl)
+{
+    $endpoint = "https://www.googleapis.com/webmasters/v3/sites/"
+        . rawurlencode($propertyUrl)
+        . "/sitemaps/"
+        . rawurlencode($sitemapUrl);
+
+    $ch = curl_init($endpoint);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => "PUT",
+        CURLOPT_HTTPHEADER => [
+            "Authorization: Bearer " . $accessToken,
+            "Content-Length: 0",
+        ],
+        CURLOPT_TIMEOUT => 30,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        return ["ok" => false, "http_code" => $httpCode, "error" => $curlError, "response" => $response];
+    }
+
+    return [
+        "ok" => ($httpCode >= 200 && $httpCode < 300),
+        "http_code" => $httpCode,
+        "error" => null,
+        "response" => $response,
+    ];
+}
+
+
+function touchAppliedProducts($sectionId, $scope = "all", $writeReportTimestamp = true)
+{
+    if (empty($sectionId)) {
+        return ["error" => "Не указана категория."];
+    }
+
+    $scope = normalizeProductScope($scope);
+    $reportFile = getReportFile($sectionId, $scope);
+    if (!file_exists($reportFile)) {
+        return ["error" => "Файл отчёта не найден: {$reportFile}"];
+    }
+
+    $report = json_decode(file_get_contents($reportFile), true);
+    if (!is_array($report)) {
+        return ["error" => "Отчёт повреждён: {$reportFile}"];
+    }
+
+    $appliedIds = [];
+    foreach ($report as $item) {
+        if (($item["status"] ?? "") === "applied") {
+            $appliedIds[] = (int)$item["id"];
+        }
+    }
+
+    if (empty($appliedIds)) {
+        return [
+            "updated" => 0,
+            "ids" => [],
+            "report_file" => $reportFile,
+            "report" => $report,
+        ];
+    }
+
+    $stmt = db()->prepare(
+        "UPDATE " . TBL_PREFIX . "product SET date_modified = NOW() WHERE product_id = :id"
+    );
+
+    $updated = 0;
+    $errors = [];
+    foreach ($appliedIds as $id) {
+        try {
+            $stmt->execute(["id" => $id]);
+            $updated++;
+        } catch (\Throwable $e) {
+            $errors[$id] = $e->getMessage();
+        }
+    }
+
+    if ($writeReportTimestamp && $updated > 0) {
+        $nowIso = date("c");
+        foreach ($report as $idx => $item) {
+            if (($item["status"] ?? "") === "applied" && !isset($errors[(int)$item["id"]])) {
+                $report[$idx]["date_modified_touched_at"] = $nowIso;
+            }
+        }
+        file_put_contents($reportFile, json_encode($report, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    }
+
+    return [
+        "updated" => $updated,
+        "ids" => $appliedIds,
+        "errors" => $errors,
+        "report_file" => $reportFile,
+        "report" => $report,
+    ];
+}
+
+function runTouchApplied($sectionId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+    echo "Режим: " . productScopeLabel($scope) . "\n";
+
+    $result = touchAppliedProducts($sectionId, $scope, true);
+    if (isset($result["error"])) {
+        echo "ОШИБКА: {$result['error']}\n";
+        exit(1);
+    }
+
+    echo "Товаров со статусом applied: " . count($result["ids"]) . "\n";
+    echo "date_modified обновлён: {$result['updated']}\n";
+
+    if (!empty($result["errors"])) {
+        foreach ($result["errors"] as $id => $error) {
+            echo "ID {$id}: ОШИБКА — {$error}\n";
+        }
+        exit(1);
+    }
+
+    echo "Готово. Описания не перезаписывались.\n";
+}
+
+function runGoogleRefresh($sectionId, $scope = "all")
+{
+    if (empty($sectionId)) {
+        echo "Ошибка: не указана категория.\n";
+        exit(1);
+    }
+
+    $scope = normalizeProductScope($scope);
+    $reportFile = getReportFile($sectionId, $scope);
+    if (!file_exists($reportFile)) {
+        echo "Файл отчёта не найден: {$reportFile}\n";
+        exit(1);
+    }
+
+    $report = json_decode(file_get_contents($reportFile), true);
+    if (!is_array($report)) {
+        echo "Отчёт повреждён: {$reportFile}\n";
+        exit(1);
+    }
+
+    $appliedIds = [];
+    foreach ($report as $item) {
+        if (($item["status"] ?? "") === "applied") {
+            $appliedIds[] = (int)$item["id"];
+        }
+    }
+
+    if (empty($appliedIds)) {
+        echo "В категории {$sectionId} нет товаров со статусом 'applied' для выбранного режима.\n";
+        exit(0);
+    }
+
+    echo "Режим: " . productScopeLabel($scope) . "\n";
+    echo "Применённых товаров в отчёте: " . count($appliedIds) . "\n";
+
+    // Перед повторной отправкой sitemap помечаем все уже применённые карточки как
+    // действительно изменённые. Это важно и для HTTP Last-Modified, и для
+    // <lastmod>, если sitemap_g строится по oc_product.date_modified.
+    $touchResult = touchAppliedProducts($sectionId, $scope, true);
+    if (isset($touchResult["error"])) {
+        echo "ОШИБКА обновления date_modified: {$touchResult['error']}\n";
+        exit(1);
+    }
+    echo "date_modified обновлён у товаров: {$touchResult['updated']}\n";
+    if (!empty($touchResult["errors"])) {
+        foreach ($touchResult["errors"] as $id => $error) {
+            echo "ID {$id}: ОШИБКА date_modified — {$error}\n";
+        }
+        exit(1);
+    }
+
+    echo "Google получает сигнал через повторную отправку sitemap_g.xml; URL по одному не отправляются.\n\n";
+
+    $tokenResult = getGoogleAccessToken();
+    if (isset($tokenResult["error"])) {
+        echo "ОШИБКА авторизации Google: {$tokenResult['error']}\n";
+        exit(1);
+    }
+
+    $accessToken = $tokenResult["access_token"];
+    $properties = loadGooglePropertyUrls();
+    echo "GSC-ресурсов для обновления: " . count($properties) . "\n";
+
+    $okCount = 0;
+    $failCount = 0;
+    foreach ($properties as $propertyUrl) {
+        $parts = parse_url($propertyUrl);
+        $scheme = $parts["scheme"] ?? "https";
+        $host = $parts["host"] ?? "";
+        if ($host === "") {
+            echo "SKIP {$propertyUrl}: не удалось определить host.\n";
+            $failCount++;
+            continue;
+        }
+
+        $sitemapUrl = $scheme . "://" . $host . GOOGLE_MAIN_SITEMAP_PATH;
+        $result = submitSitemapToGoogle($accessToken, $propertyUrl, $sitemapUrl);
+        if ($result["ok"]) {
+            echo "OK   {$propertyUrl} -> {$sitemapUrl} (HTTP {$result['http_code']})\n";
+            $okCount++;
+        } else {
+            $detail = trim((string)($result["error"] ?: $result["response"]));
+            if (strlen($detail) > 300) {
+                $detail = substr($detail, 0, 300) . "...";
+            }
+            echo "FAIL {$propertyUrl} -> HTTP {$result['http_code']} {$detail}\n";
+            $failCount++;
+        }
+    }
+
+    $nowIso = date("c");
+    if ($okCount > 0) {
+        foreach ($report as $idx => $item) {
+            if (($item["status"] ?? "") === "applied") {
+                $report[$idx]["google_sitemap_refreshed_at"] = $nowIso;
+            }
+        }
+        file_put_contents($reportFile, json_encode($report, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+    }
+
+    echo "\nГотово: успешно {$okCount}, ошибок {$failCount}.\n";
+    if ($failCount > 0) {
+        exit(1);
+    }
 }
 
 // ==================== IndexNow ====================
@@ -530,18 +1567,27 @@ function submitIndexNow($urls)
 
 // ==================== РЕЖИМ: REVIEW ====================
 
-function runReview($sectionId, $extraInstructions, $limit = 0)
+function runReview($sectionId, $extraInstructions, $limit = 0, $scope = "all")
 {
     if (empty(ROUTER_CHEAP_API_KEY)) {
         echo "Ошибка: не задан ROUTER_CHEAP_API_KEY (переменная окружения).\n";
         exit(1);
     }
     if (empty($sectionId)) {
-        echo "Ошибка: не указана категория. Запусти как: php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT]\n";
+        echo "Ошибка: не указана категория. Запусти как: php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT] [--scope=all|google_indexable|google_impressions]\n";
         exit(1);
     }
 
-    $elementIds = getElementIdsBySection($sectionId);
+    $scope = normalizeProductScope($scope);
+
+    $linkCatalog = ensureInternalLinksCatalog(false);
+    if (isset($linkCatalog["error"])) {
+        echo "[перелинковка] ПРЕДУПРЕЖДЕНИЕ: {$linkCatalog['error']}\n";
+    } else {
+        echo "[перелинковка] Каталог: " . count($linkCatalog["links"] ?? []) . " URL.\n";
+    }
+
+    $elementIds = getElementIdsBySection($sectionId, $scope);
 
     if (empty($elementIds)) {
         echo "В категории {$sectionId} нет активных товаров.\n";
@@ -554,7 +1600,8 @@ function runReview($sectionId, $extraInstructions, $limit = 0)
         $elementIds = array_slice($elementIds, 0, $limit);
     }
 
-    echo "Всего товаров в категории: {$totalInSection}\n";
+    echo "Режим выборки: " . productScopeLabel($scope) . "\n";
+    echo "Товаров по выбранному фильтру: {$totalInSection}\n";
     echo "Будет обработано в этом запуске: " . count($elementIds) . "\n";
 
     $usedPromptFile = basename(getPromptFilePath($sectionId, $GLOBALS['SECTION_PROMPT_FILES']));
@@ -564,7 +1611,7 @@ function runReview($sectionId, $extraInstructions, $limit = 0)
     }
     echo "\n";
 
-    $reportFile = getReportFile($sectionId);
+    $reportFile = getReportFile($sectionId, $scope);
 
     $report = [];
     $doneIds = [];
@@ -620,6 +1667,7 @@ function runReview($sectionId, $extraInstructions, $limit = 0)
         }
 
         $prompt = buildPrompt($product, $sectionId, $extraInstructions, $GLOBALS['SECTION_PROMPT_FILES']);
+        $internalLinksMax = extractInternalLinksMaxFromRenderedPrompt($prompt);
         $result = callClaudeAPI($prompt);
 
         if (isset($result["error"])) {
@@ -634,18 +1682,21 @@ function runReview($sectionId, $extraInstructions, $limit = 0)
             continue;
         }
 
-        echo "готово (" . mb_strlen($result["text"]) . " симв.)\n";
+        $cleanGeneratedText = sanitizeGeneratedInternalLinks($result["text"], $internalLinksMax);
+        $usedInternalLinks = extractInternalLinksFromHtml($cleanGeneratedText);
+        echo "готово (" . mb_strlen($cleanGeneratedText) . " симв., внутренних ссылок: " . count($usedInternalLinks) . ")\n";
 
         // Приклеиваем фиксированный коммерческий блок кодом (не ИИ) — так
         // гарантированно сохраняются правильные плейсхолдеры %CITY%/%PHONE%/%EMAIL%,
         // которые сайт сам заменит на нужные значения при отображении.
-        $finalText = trim($result["text"]) . "\n\n" . COMMERCIAL_FOOTER_HTML;
+        $finalText = trim($cleanGeneratedText) . "\n\n" . COMMERCIAL_FOOTER_HTML;
 
         $report[$id] = [
             "id" => $id,
             "name" => $product["name"],
             "status" => "approved",
             "detail_text" => $finalText,
+            "internal_links" => $usedInternalLinks,
         ];
         $saveReport();
 
@@ -653,12 +1704,17 @@ function runReview($sectionId, $extraInstructions, $limit = 0)
     }
 
     echo "\nГотово. Отчёт сохранён: " . $reportFile . "\n";
-    echo "Затем запусти: php ai_generate_descriptions_oc.php apply {$sectionId}\n";
+    echo "Затем запусти: php ai_generate_descriptions_oc.php apply {$sectionId} --scope={$scope}\n";
 }
 
-function getReportFile($sectionId)
+function getReportFile($sectionId, $scope = "all")
 {
-    return __DIR__ . "/ai_desc_report_section_{$sectionId}.json";
+    $scope = normalizeProductScope($scope);
+    if ($scope === "all") {
+        // Старое имя сохраняем для полной обратной совместимости.
+        return __DIR__ . "/ai_desc_report_section_{$sectionId}.json";
+    }
+    return __DIR__ . "/ai_desc_report_section_{$sectionId}_{$scope}.json";
 }
 
 // ==================== OCFILTER: SEO-СТРАНИЦЫ ФИЛЬТРОВ ====================
@@ -749,7 +1805,7 @@ function ocFilterMetaInstructionBlock($categoryName, $params)
         . "- META_DESCRIPTION - самостоятельный содержательный текст (не обрезок основного текста), 2-3 законченных предложения. Можешь естественно упомянуть город и/или контакты через плейсхолдеры %CITY% (именительный падеж), %CITYS% (предложный падеж), %TELEPHONE%, %EMAIL% - но ТОЛЬКО этими четырьмя словами В ТОЧНОСТИ, с символами % с обеих сторон, без изменений и без своих плейсхолдеров. %CITYS% УЖЕ в предложном падеже (после подстановки получится, например, «Москве») - перед ним ВСЕГДА ставь предлог «в» вплотную: пиши «в %CITYS%», никогда не пиши голое «%CITYS%» без «в» перед ним (иначе получится грамматическая ошибка вида «...по телефону Москве...»). Использовать плейсхолдеры не обязательно - только если естественно вписывается.\n";
 }
 
-function buildOcFilterPrompt($categoryName, $params, $keyword, $batchId, $sectionPromptFiles)
+function buildOcFilterPrompt($categoryName, $params, $keyword, $batchId, $sectionPromptFiles, $categoryId = null)
 {
     ensureOcFilterDefaultPrompt();
     $promptFile = getOcFilterPromptFilePath($batchId, $sectionPromptFiles);
@@ -763,7 +1819,25 @@ function buildOcFilterPrompt($categoryName, $params, $keyword, $batchId, $sectio
         "{{PARAMS}}" => $params,
         "{{KEYWORD}}" => $keyword,
     ];
-    return str_replace(array_keys($replacements), array_values($replacements), $template);
+    $basePrompt = str_replace(array_keys($replacements), array_values($replacements), $template);
+
+    $excludeHref = "";
+    if ($categoryId !== null) {
+        foreach (loadInternalLinksList() as $link) {
+            if (($link["type"] ?? "") === "ocfilter"
+                && (int)($link["category_id"] ?? 0) === (int)$categoryId
+                && trim((string)($link["params"] ?? ""), "/") === trim((string)$params, "/")) {
+                $excludeHref = $link["href"] ?? "";
+                break;
+            }
+        }
+    }
+
+    $internalLinksMax = extractInternalLinksMaxFromTemplate($template);
+    $linkContext = $categoryName . " " . $params . " " . $keyword;
+    $candidates = selectInternalLinkCandidates($linkContext, $categoryId, $excludeHref, INTERNAL_LINKS_MAX_CANDIDATES);
+    $linkBlock = buildInternalLinkPromptBlock($candidates, $internalLinksMax);
+    return injectInternalLinksBlock($basePrompt, $linkBlock);
 }
 
 // Короткий повторный запрос — только TITLE/H1/META_DESCRIPTION, без основного
@@ -989,6 +2063,13 @@ function runGenOcFilter($batchId, $limit = 0)
         exit(1);
     }
 
+    $linkCatalog = ensureInternalLinksCatalog(false);
+    if (isset($linkCatalog["error"])) {
+        echo "[перелинковка] ПРЕДУПРЕЖДЕНИЕ: {$linkCatalog['error']}\n";
+    } else {
+        echo "[перелинковка] Каталог: " . count($linkCatalog["links"] ?? []) . " URL.\n";
+    }
+
     $inputFile = getOcFilterInputFile($batchId);
     if (!file_exists($inputFile)) {
         echo "Не найден файл со списком страниц: {$inputFile}\n";
@@ -1064,7 +2145,8 @@ function runGenOcFilter($batchId, $limit = 0)
             continue;
         }
 
-        $prompt = buildOcFilterPrompt($category["category_name"], $item["params"], $keyword, $batchId, $SECTION_PROMPT_FILES);
+        $prompt = buildOcFilterPrompt($category["category_name"], $item["params"], $keyword, $batchId, $SECTION_PROMPT_FILES, $category["category_id"]);
+        $internalLinksMax = extractInternalLinksMaxFromRenderedPrompt($prompt);
         $result = callClaudeAPI($prompt);
 
         if (isset($result["error"])) {
@@ -1144,6 +2226,11 @@ function runGenOcFilter($batchId, $limit = 0)
         // плейсхолдеры и название компании были гарантированно правильными.
         $pageMetaTitle = rtrim($pageTitle, " .") . OCFILTER_TITLE_SUFFIX;
 
+        // Проверяем перелинковку после отделения META-блоков. Любой href,
+        // которого нет в каталоге, снимается, но сам текст анкоров сохраняется.
+        $bodyText = sanitizeGeneratedInternalLinks($bodyText, $internalLinksMax);
+        $usedInternalLinks = extractInternalLinksFromHtml($bodyText);
+
         // Контактный блок с %CITYS%/%TELEPHONE%/%EMAIL% — тоже кодом, тоже
         // после того, как meta_description уже посчитан из чистого $bodyText
         // (иначе в meta_description мог попасть обрезок контактного блока).
@@ -1163,6 +2250,7 @@ function runGenOcFilter($batchId, $limit = 0)
             "description" => $finalBodyText,
             "button" => $pageNameClean,
             "meta_phrase_source" => $metaSource,
+            "internal_links" => $usedInternalLinks,
         ];
         $saveReport();
 
@@ -1285,6 +2373,205 @@ function runApplyOcFilter($batchId)
     echo "\nГотово.\n";
 }
 
+
+
+// ==================== РЕЖИМ: ПЕРЕЛИНКОВКА СУЩЕСТВУЮЩИХ ТЕКСТОВ ====================
+
+function normalizeRelinkComparableText($html)
+{
+    $text = html_entity_decode(strip_tags((string)$html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $text = preg_replace('/\s+/u', ' ', trim($text));
+    return $text;
+}
+
+function getRelinkReportFile($sectionId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+    if ($scope === "all") {
+        return __DIR__ . "/ai_relink_report_section_{$sectionId}.json";
+    }
+    return __DIR__ . "/ai_relink_report_section_{$sectionId}_{$scope}.json";
+}
+
+function getOcFilterRelinkReportFile($batchId)
+{
+    return __DIR__ . "/ai_ocfilter_relink_report_batch_{$batchId}.json";
+}
+
+function buildRelinkOnlyPrompt($html, $candidates, $maxLinks, $contextLabel)
+{
+    $linkBlock = buildInternalLinkPromptBlock($candidates, $maxLinks);
+    return "ЗАДАЧА: добавить внутреннюю перелинковку в УЖЕ ГОТОВЫЙ HTML-текст.\n\n"
+        . "Контекст: {$contextLabel}\n\n"
+        . "КРИТИЧЕСКИЕ ПРАВИЛА:\n"
+        . "- НЕ переписывай текст, НЕ сокращай и НЕ расширяй его.\n"
+        . "- НЕ меняй слова, окончания, пунктуацию, числа, факты, порядок предложений и абзацев.\n"
+        . "- НЕ добавляй новые предложения и заголовки.\n"
+        . "- Разрешено только обернуть уже существующие подходящие слова/словосочетания тегом <a href=\"...\">...</a>.\n"
+        . "- Сохрани все существующие HTML-теги и плейсхолдеры.\n"
+        . "- Верни ТОЛЬКО итоговый HTML без пояснений, markdown и служебного текста.\n"
+        . $linkBlock
+        . "\nИСХОДНЫЙ HTML (его текст должен остаться дословно тем же):\n"
+        . $html;
+}
+
+function runRelinkReview($sectionId, $limit = 0, $scope = "all")
+{
+    if (empty(ROUTER_CHEAP_API_KEY)) {
+        echo "Ошибка: не задан ROUTER_CHEAP_API_KEY.\n";
+        exit(1);
+    }
+    if (empty($sectionId)) {
+        echo "Использование: php ai_generate_descriptions_oc.php relinkreview <CATEGORY_ID> [LIMIT] [--scope=...]\n";
+        exit(1);
+    }
+    $scope = normalizeProductScope($scope);
+    $catalog = ensureInternalLinksCatalog(false);
+    if (isset($catalog['error'])) {
+        echo "Ошибка каталога перелинковки: {$catalog['error']}\n";
+        exit(1);
+    }
+
+    $ids = getElementIdsBySection($sectionId, $scope);
+    if ($limit > 0) $ids = array_slice($ids, 0, $limit);
+    $reportFile = getRelinkReportFile($sectionId, $scope);
+    $report = [];
+    if (file_exists($reportFile)) {
+        $old = json_decode(file_get_contents($reportFile), true);
+        if (is_array($old)) foreach ($old as $item) $report[$item['id']] = $item;
+    }
+
+    $templatePath = getPromptFilePath($sectionId, $GLOBALS['SECTION_PROMPT_FILES']);
+    $template = file_exists($templatePath) ? file_get_contents($templatePath) : '';
+    $maxLinks = extractInternalLinksMaxFromTemplate($template);
+    if ($maxLinks <= 0) $maxLinks = INTERNAL_LINKS_DEFAULT_MAX_LINKS;
+
+    echo "Перелинковка существующих описаний. Категория {$sectionId}; режим: " . productScopeLabel($scope) . "; максимум ссылок: {$maxLinks}\n";
+    foreach ($ids as $id) {
+        if (isset($report[$id]) && in_array($report[$id]['status'] ?? '', ['relink_ready','applied'], true)) continue;
+        $product = getProductContext($id);
+        if (!$product) continue;
+        $html = trim((string)($product['existing_text_html'] ?? ''));
+        if ($html === '') {
+            echo "ID {$id}: пустое описание, пропуск.\n";
+            continue;
+        }
+        $context = trim(($product['name'] ?? '') . ' ' . ($product['section'] ?? '') . ' ' . strip_tags($html));
+        $candidates = selectInternalLinkCandidates($context, $sectionId, '', INTERNAL_LINKS_MAX_CANDIDATES);
+        if (!$candidates) {
+            echo "ID {$id}: подходящих ссылок нет, пропуск.\n";
+            continue;
+        }
+        echo "ID {$id}: добавляю перелинковку... ";
+        $prompt = buildRelinkOnlyPrompt($html, $candidates, $maxLinks, 'товар ' . ($product['name'] ?? $id));
+        $result = callClaudeAPI($prompt);
+        if (isset($result['error'])) {
+            echo "ОШИБКА: {$result['error']}\n";
+            $report[$id] = ['id'=>$id,'name'=>$product['name'] ?? '','status'=>'error','error'=>$result['error']];
+        } else {
+            $newHtml = sanitizeGeneratedInternalLinks($result['text'], $maxLinks);
+            if (normalizeRelinkComparableText($newHtml) !== normalizeRelinkComparableText($html)) {
+                echo "ОТКЛОНЕНО: модель изменила текст.\n";
+                $report[$id] = ['id'=>$id,'name'=>$product['name'] ?? '','status'=>'error','error'=>'AI changed source text'];
+            } else {
+                $links = extractInternalLinksFromHtml($newHtml);
+                echo "готово, ссылок: " . count($links) . ".\n";
+                $report[$id] = [
+                    'id'=>$id,'name'=>$product['name'] ?? '','status'=>'relink_ready',
+                    'original_text'=>$html,'detail_text'=>$newHtml,'internal_links'=>$links,
+                ];
+            }
+        }
+        file_put_contents($reportFile, json_encode(array_values($report), JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+        usleep(500000);
+    }
+    echo "\nГотово. Отчёт: {$reportFile}\nДля записи: php ai_generate_descriptions_oc.php relinkapply {$sectionId} --scope={$scope}\n";
+}
+
+function runRelinkApply($sectionId, $scope = "all")
+{
+    $scope = normalizeProductScope($scope);
+    $reportFile = getRelinkReportFile($sectionId, $scope);
+    if (!file_exists($reportFile)) { echo "Отчёт перелинковки не найден: {$reportFile}\n"; exit(1); }
+    $report = json_decode(file_get_contents($reportFile), true);
+    $upd = db()->prepare("UPDATE " . TBL_PREFIX . "product_description SET description=:text WHERE product_id=:id AND language_id=:lang");
+    $touch = db()->prepare("UPDATE " . TBL_PREFIX . "product SET date_modified=NOW() WHERE product_id=:id");
+    $changed = false;
+    foreach ($report as $i=>$item) {
+        if (($item['status'] ?? '') !== 'relink_ready') continue;
+        $upd->execute(['text'=>$item['detail_text'],'id'=>$item['id'],'lang'=>LANGUAGE_ID]);
+        $touch->execute(['id'=>$item['id']]);
+        $report[$i]['status']='applied';
+        $report[$i]['applied_at']=date('c');
+        $changed=true;
+        echo "ID {$item['id']}: перелинковка записана.\n";
+    }
+    if ($changed) file_put_contents($reportFile, json_encode($report, JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+    echo "Готово.\n";
+}
+
+function runRelinkOcFilterReview($batchId, $limit = 0)
+{
+    if (empty(ROUTER_CHEAP_API_KEY)) { echo "Ошибка: не задан ROUTER_CHEAP_API_KEY.\n"; exit(1); }
+    $inputFile = getOcFilterInputFile($batchId);
+    if (!file_exists($inputFile)) { echo "Не найден список SEO-страниц: {$inputFile}\n"; exit(1); }
+    ensureInternalLinksCatalog(false);
+    $lines = file($inputFile, FILE_IGNORE_NEW_LINES);
+    $items=[]; foreach ($lines as $line) { $p=parseOcFilterInputLine($line); if ($p) $items[]=$p; }
+    if ($limit > 0) $items=array_slice($items,0,$limit);
+    $reportFile=getOcFilterRelinkReportFile($batchId);
+    $report=[]; if (file_exists($reportFile)) { $old=json_decode(file_get_contents($reportFile),true); if(is_array($old)) foreach($old as $x) $report[$x['keyword']]=$x; }
+    $promptPath=getOcFilterPromptFilePath($batchId,$GLOBALS['SECTION_PROMPT_FILES']);
+    $template=file_exists($promptPath)?file_get_contents($promptPath):'';
+    $maxLinks=extractInternalLinksMaxFromTemplate($template); if($maxLinks<=0)$maxLinks=INTERNAL_LINKS_DEFAULT_MAX_LINKS;
+
+    foreach ($items as $item) {
+        $keyword=$item['keyword'];
+        if(isset($report[$keyword]) && in_array($report[$keyword]['status']??'', ['relink_ready','applied'],true)) continue;
+        $cat=resolveOcFilterCategory($item['category_input']);
+        if(!$cat){ echo "{$keyword}: категория не найдена.\n"; continue; }
+        $stmt=db()->prepare("SELECT p.ocfilter_page_id,p.params,p.keyword,d.description FROM ".TBL_PREFIX."ocfilter_page p JOIN ".TBL_PREFIX."ocfilter_page_description d ON d.ocfilter_page_id=p.ocfilter_page_id AND d.language_id=:lang WHERE p.category_id=:cat AND p.keyword=:kw LIMIT 1");
+        $stmt->execute(['lang'=>LANGUAGE_ID,'cat'=>$cat['category_id'],'kw'=>$keyword]);
+        $row=$stmt->fetch(PDO::FETCH_ASSOC);
+        if(!$row || trim((string)$row['description'])===''){ echo "{$keyword}: существующий текст не найден, пропуск.\n"; continue; }
+        $html=$row['description'];
+        $exclude=''; foreach(loadInternalLinksList() as $ln){ if(($ln['type']??'')==='ocfilter' && (int)($ln['ocfilter_page_id']??0)===(int)$row['ocfilter_page_id']){$exclude=$ln['href']??'';break;} }
+        $context=$cat['category_name'].' '.$row['params'].' '.strip_tags($html);
+        $candidates=selectInternalLinkCandidates($context,$cat['category_id'],$exclude,INTERNAL_LINKS_MAX_CANDIDATES);
+        if(!$candidates){ echo "{$keyword}: подходящих ссылок нет.\n"; continue; }
+        echo "{$keyword}: добавляю перелинковку... ";
+        $result=callClaudeAPI(buildRelinkOnlyPrompt($html,$candidates,$maxLinks,'SEO-страница '.$keyword));
+        if(isset($result['error'])){ echo "ОШИБКА: {$result['error']}\n"; $report[$keyword]=['keyword'=>$keyword,'status'=>'error','error'=>$result['error']]; }
+        else {
+            $newHtml=sanitizeGeneratedInternalLinks($result['text'],$maxLinks);
+            if(normalizeRelinkComparableText($newHtml)!==normalizeRelinkComparableText($html)){ echo "ОТКЛОНЕНО: модель изменила текст.\n"; $report[$keyword]=['keyword'=>$keyword,'status'=>'error','error'=>'AI changed source text']; }
+            else { $links=extractInternalLinksFromHtml($newHtml); echo "готово, ссылок: ".count($links).".\n"; $report[$keyword]=['keyword'=>$keyword,'ocfilter_page_id'=>(int)$row['ocfilter_page_id'],'category_id'=>$cat['category_id'],'status'=>'relink_ready','original_text'=>$html,'description'=>$newHtml,'internal_links'=>$links]; }
+        }
+        file_put_contents($reportFile,json_encode(array_values($report),JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+        usleep(500000);
+    }
+    echo "\nГотово. Отчёт: {$reportFile}\nДля записи: php ai_generate_descriptions_oc.php relinkocfilterapply {$batchId}\n";
+}
+
+function runRelinkOcFilterApply($batchId)
+{
+    $reportFile=getOcFilterRelinkReportFile($batchId);
+    if(!file_exists($reportFile)){echo "Отчёт перелинковки не найден: {$reportFile}\n";exit(1);}
+    $report=json_decode(file_get_contents($reportFile),true);
+    $upd=db()->prepare("UPDATE ".TBL_PREFIX."ocfilter_page_description SET description=:text WHERE ocfilter_page_id=:id AND language_id=:lang");
+    $touch=db()->prepare("UPDATE ".TBL_PREFIX."ocfilter_page SET date_modified=NOW() WHERE ocfilter_page_id=:id");
+    $changed=false;
+    foreach($report as $i=>$item){
+        if(($item['status']??'')!=='relink_ready')continue;
+        $upd->execute(['text'=>$item['description'],'id'=>$item['ocfilter_page_id'],'lang'=>LANGUAGE_ID]);
+        $touch->execute(['id'=>$item['ocfilter_page_id']]);
+        $report[$i]['status']='applied';$report[$i]['applied_at']=date('c');$changed=true;
+        echo "SEO {$item['keyword']}: перелинковка записана.\n";
+    }
+    if($changed)file_put_contents($reportFile,json_encode($report,JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES));
+    echo "Готово.\n";
+}
+
 function getOcFilterPageUrl($keyword)
 {
     return SITE_PROTOCOL . "://" . SITE_HOST . "/" . $keyword;
@@ -1292,14 +2579,15 @@ function getOcFilterPageUrl($keyword)
 
 // ==================== РЕЖИМ: APPLY ====================
 
-function runApply($sectionId)
+function runApply($sectionId, $scope = "all")
 {
     if (empty($sectionId)) {
-        echo "Ошибка: не указана категория. Запусти как: php ai_generate_descriptions_oc.php apply <CATEGORY_ID>\n";
+        echo "Ошибка: не указана категория. Запусти как: php ai_generate_descriptions_oc.php apply <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
         exit(1);
     }
 
-    $reportFile = getReportFile($sectionId);
+    $scope = normalizeProductScope($scope);
+    $reportFile = getReportFile($sectionId, $scope);
 
     if (!file_exists($reportFile)) {
         echo "Файл отчёта не найден: " . $reportFile . ". Сначала запусти review.\n";
@@ -1326,8 +2614,22 @@ function runApply($sectionId)
                 "id" => $item["id"],
                 "lang" => LANGUAGE_ID,
             ]);
+
+            // Обновляем date_modified самого товара. Это корректно отражает факт
+            // изменения карточки и позволяет генератору sitemap использовать свежий
+            // <lastmod>, если он строится по product.date_modified.
+            try {
+                $touchStmt = db()->prepare(
+                    "UPDATE " . TBL_PREFIX . "product SET date_modified = NOW() WHERE product_id = :id"
+                );
+                $touchStmt->execute(["id" => $item["id"]]);
+            } catch (\Throwable $touchError) {
+                echo "ID {$item['id']}: предупреждение — не удалось обновить date_modified: {$touchError->getMessage()}\n";
+            }
+
             echo "ID {$item['id']}: описание обновлено.\n";
             $report[$idx]["status"] = "applied";
+            $report[$idx]["applied_at"] = date("c");
             $changed = true;
         } catch (\Throwable $e) {
             echo "ID {$item['id']}: ОШИБКА при обновлении — {$e->getMessage()}\n";
@@ -1348,14 +2650,15 @@ $mode = $argv[1] ?? "";
 $sectionArg = isset($argv[2]) ? (int)$argv[2] : $DEFAULT_SECTION_ID;
 $limitArg = isset($argv[3]) ? (int)$argv[3] : 0;
 $extraInstructions = "";
+$productScopeArg = getProductScopeFromArgv($argv);
 
 switch ($mode) {
     case "review":
-        runReview($sectionArg, $extraInstructions, $limitArg);
+        runReview($sectionArg, $extraInstructions, $limitArg, $productScopeArg);
         break;
 
     case "apply":
-        runApply($sectionArg);
+        runApply($sectionArg, $productScopeArg);
         break;
 
     case "preview":
@@ -1364,7 +2667,7 @@ switch ($mode) {
             echo "Использование: php ai_generate_descriptions_oc.php preview <CATEGORY_ID> <PRODUCT_ID>\n";
             exit(1);
         }
-        $reportFile = getReportFile($sectionArg);
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
         if (!file_exists($reportFile)) {
             echo "Файл отчёта не найден: {$reportFile}\n";
             exit(1);
@@ -1409,9 +2712,9 @@ switch ($mode) {
         break;
 
     case "count":
-        $elementIds = getElementIdsBySection($sectionArg);
+        $elementIds = getElementIdsBySection($sectionArg, $productScopeArg);
         $totalInSection = count($elementIds);
-        $reportFile = getReportFile($sectionArg);
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
         $generated = 0;
         $applied = 0;
         if (file_exists($reportFile)) {
@@ -1428,29 +2731,28 @@ switch ($mode) {
                 }
             }
         }
-        echo "\nКатегория {$sectionArg}: сгенерировано и одобрено — {$generated} товаров из {$totalInSection}\n";
+        echo "\nРежим: " . productScopeLabel($productScopeArg) . "\n";
+        echo "Категория {$sectionArg}: сгенерировано и одобрено — {$generated} товаров из {$totalInSection}\n";
         echo "Из них применено — {$applied} из {$totalInSection}\n";
         break;
 
     case "listreadyids":
-        // НЕ список товаров — список КАТЕГОРИЙ, для которых на сервере уже
-        // есть отчёт с хотя бы одним готовым текстом товара (approved —
-        // сгенерирован, ещё не записан в OpenCart, ИЛИ applied — уже
-        // записан). Сканируем ВСЕ файлы ai_desc_report_section_<ID>.json в
-        // папке скрипта (а не только текущий "ID раздела" из формы), ID
-        // категории берём из имени файла, название — из БД.
-        // Вывод: "ID - Название категории", отсортировано по возрастанию ID.
+        // Показываем отчёты всех трёх режимов отдельно, чтобы не смешивать
+        // статистику одной и той же категории. Старый файл без суффикса = all.
         $reportFiles = glob(__DIR__ . "/ai_desc_report_section_*.json");
-        $readySections = []; // categoryId => ["name" => ..., "ready" => N, "applied" => N]
+        $readySections = [];
         foreach ($reportFiles as $reportFilePath) {
-            if (!preg_match('/ai_desc_report_section_(\d+)\.json$/', $reportFilePath, $m)) {
+            if (!preg_match('/ai_desc_report_section_(\d+)(?:_(google_indexable|google_impressions))?\.json$/', $reportFilePath, $m)) {
                 continue;
             }
+
             $reportCategoryId = (int)$m[1];
+            $reportScope = !empty($m[2]) ? $m[2] : "all";
             $reportData = json_decode(file_get_contents($reportFilePath), true);
             if (!is_array($reportData)) {
                 continue;
             }
+
             $readyCount = 0;
             $appliedCount = 0;
             foreach ($reportData as $reportItem) {
@@ -1465,6 +2767,7 @@ switch ($mode) {
             if ($readyCount === 0) {
                 continue;
             }
+
             $categoryName = "";
             try {
                 $catStmt = db()->prepare(
@@ -1475,21 +2778,32 @@ switch ($mode) {
                 $catRow = $catStmt->fetch(PDO::FETCH_ASSOC);
                 $categoryName = $catRow["name"] ?? "";
             } catch (\Throwable $e) {
-                // категория могла быть удалена — просто покажем ID без названия
+                // категория могла быть удалена
             }
-            $readySections[$reportCategoryId] = [
+
+            $readySections[] = [
+                "category_id" => $reportCategoryId,
+                "scope" => $reportScope,
                 "name" => $categoryName,
                 "ready" => $readyCount,
                 "applied" => $appliedCount,
             ];
         }
-        ksort($readySections, SORT_NUMERIC);
-        echo "Категорий с готовыми текстами товаров — " . count($readySections) . "\n";
-        foreach ($readySections as $readyCategoryId => $readyInfo) {
+
+        usort($readySections, function ($a, $b) {
+            $cmp = $a["category_id"] <=> $b["category_id"];
+            if ($cmp !== 0) {
+                return $cmp;
+            }
+            return strcmp($a["scope"], $b["scope"]);
+        });
+
+        echo "Отчётов категорий с готовыми текстами товаров — " . count($readySections) . "\n";
+        foreach ($readySections as $readyInfo) {
+            $scopeLabel = productScopeLabel($readyInfo["scope"]);
             $countsStr = "готово: {$readyInfo['ready']}, на сайте: {$readyInfo['applied']}";
-            echo $readyInfo["name"] !== ""
-                ? "{$readyCategoryId} - {$readyInfo['name']} ({$countsStr})\n"
-                : "{$readyCategoryId} ({$countsStr})\n";
+            $namePart = $readyInfo["name"] !== "" ? " - {$readyInfo['name']}" : "";
+            echo "{$readyInfo['category_id']}{$namePart} [{$scopeLabel}] ({$countsStr})\n";
         }
         break;
 
@@ -1552,9 +2866,9 @@ switch ($mode) {
         break;
 
     case "listapplied":
-        $elementIds = getElementIdsBySection($sectionArg);
+        $elementIds = getElementIdsBySection($sectionArg, $productScopeArg);
         $totalInSection = count($elementIds);
-        $reportFile = getReportFile($sectionArg);
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
         if (!file_exists($reportFile)) {
             echo "Файл отчёта не найден: {$reportFile}\n";
             exit(1);
@@ -1654,6 +2968,25 @@ switch ($mode) {
         foreach ($ocResult["results"] as $batchResult) {
             echo "Пакет из {$batchResult['batch_size']} URL — HTTP {$batchResult['http_code']}\n";
         }
+        break;
+
+    case "buildlinks":
+        echo "Обновляю каталог внутренней перелинковки из БД...\n";
+        $linkCatalog = ensureInternalLinksCatalog(true);
+        if (isset($linkCatalog["error"])) {
+            echo "ОШИБКА: {$linkCatalog['error']}\n";
+            exit(1);
+        }
+        $categoryCount = 0;
+        $ocfilterCount = 0;
+        foreach ($linkCatalog["links"] as $linkItem) {
+            if (($linkItem["type"] ?? "") === "category") $categoryCount++;
+            if (($linkItem["type"] ?? "") === "ocfilter") $ocfilterCount++;
+        }
+        echo "Категорий: {$categoryCount}\n";
+        echo "SEO-страниц OCFilter: {$ocfilterCount}\n";
+        echo "Всего URL: " . count($linkCatalog["links"]) . "\n";
+        echo "Файл: " . INTERNAL_LINKS_CATALOG_FILE . "\n";
         break;
 
     case "whichprompt":
@@ -1963,11 +3296,35 @@ OLDFOOTER;
         echo "\nГотово. Блок добавлен к {$count} товарам.\n";
         break;
 
+    case "relinkreview":
+        runRelinkReview($sectionArg, (int)$limitArg, $productScopeArg);
+        break;
+
+    case "relinkapply":
+        runRelinkApply($sectionArg, $productScopeArg);
+        break;
+
+    case "relinkocfilterreview":
+        runRelinkOcFilterReview($sectionArg, (int)$limitArg);
+        break;
+
+    case "relinkocfilterapply":
+        runRelinkOcFilterApply($sectionArg);
+        break;
+
+    case "touchapplied":
+        runTouchApplied($sectionArg, $productScopeArg);
+        break;
+
+    case "googlerefresh":
+        runGoogleRefresh($sectionArg, $productScopeArg);
+        break;
+
     case "indexnow":
         $keyFilePath = ensureIndexNowKeyFile();
         echo "Файл-подтверждение IndexNow: {$keyFilePath}\n";
 
-        $reportFile = getReportFile($sectionArg);
+        $reportFile = getReportFile($sectionArg, $productScopeArg);
         if (!file_exists($reportFile)) {
             echo "Файл отчёта не найден: {$reportFile}\n";
             exit(1);
@@ -2011,11 +3368,11 @@ OLDFOOTER;
 
     default:
         echo "Использование:\n";
-        echo "  php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT]\n";
-        echo "  php ai_generate_descriptions_oc.php apply <CATEGORY_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php review <CATEGORY_ID> [LIMIT] [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php apply <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
         echo "  php ai_generate_descriptions_oc.php preview <CATEGORY_ID> <PRODUCT_ID>\n";
         echo "  php ai_generate_descriptions_oc.php dumpprompt <CATEGORY_ID> <PRODUCT_ID>\n";
-        echo "  php ai_generate_descriptions_oc.php count <CATEGORY_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php count <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
         echo "  php ai_generate_descriptions_oc.php listapplied <CATEGORY_ID>\n";
         echo "  php ai_generate_descriptions_oc.php listprompts\n";
         echo "  php ai_generate_descriptions_oc.php bindprompt <CATEGORY_ID> <FILENAME>\n";
@@ -2023,7 +3380,13 @@ OLDFOOTER;
         echo "  php ai_generate_descriptions_oc.php listmapping\n";
         echo "  php ai_generate_descriptions_oc.php listmissingfooter — показать товары без коммерческого блока в description\n";
         echo "  php ai_generate_descriptions_oc.php addfooterall     — дописать блок ВСЕМ товарам с описанием, у кого его нет\n";
-        echo "  php ai_generate_descriptions_oc.php indexnow <CATEGORY_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php indexnow <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php relinkreview <CATEGORY_ID> [LIMIT] [--scope=...]\n";
+        echo "  php ai_generate_descriptions_oc.php relinkapply <CATEGORY_ID> [--scope=...]\n";
+        echo "  php ai_generate_descriptions_oc.php relinkocfilterreview <BATCH_ID> [LIMIT]\n";
+        echo "  php ai_generate_descriptions_oc.php relinkocfilterapply <BATCH_ID>\n";
+        echo "  php ai_generate_descriptions_oc.php touchapplied <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
+        echo "  php ai_generate_descriptions_oc.php googlerefresh <CATEGORY_ID> [--scope=all|google_indexable|google_impressions]\n";
         echo "\n  OCFilter (SEO-страницы фильтров):\n";
         echo "  php ai_generate_descriptions_oc.php genocfilter <BATCH_ID> [LIMIT]\n";
         echo "  php ai_generate_descriptions_oc.php applyocfilter <BATCH_ID>\n";
